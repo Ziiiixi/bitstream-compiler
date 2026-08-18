@@ -385,8 +385,8 @@ More detailed operation contracts are documented in
 | Workload | Dependency edges | Edges without a finite byte range | Required dependency proofs | Final result |
 |---|---:|---:|---:|---|
 | cuJSON tokenizer | 14 | 2 | 2 | legal speculative-fusion descriptor |
-| gpJSON | 13 | 3 | 3 | legal decoupled-lookback descriptor |
-| BitGen regex example | 27 | 0 | 0 | legal regex-state descriptor |
+| gpJSON | 13 | 3 | 3 | legal speculative-fusion descriptor |
+| BitGen regex example | 27 | 0 | 0 | No descriptor |
 
 These counts describe the committed prepared inputs and should be regenerated
 when the compiler or inputs change.
