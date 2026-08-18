@@ -332,11 +332,6 @@ The physical interval is
 to the IDs of the real producer write and consumer read. There is no separate
 `bitstream.access`, dimension, iteration-domain, extent, or footprint summary.
 
-`producer_byte_range` is a two-result affine map describing the finite
-half-open producer interval needed by a consumer. Its presence is the bounded
-witness. Dependencies with a scan producer, a recurrence-varying read, or a
-loop-carried predecessor read have no such map and appear in the unbounded
-group.
 
 Every dependency also has an independent finite-state status:
 
