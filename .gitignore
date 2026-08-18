@@ -1,0 +1,28 @@
+# Local build trees
+/build*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+build.ninja
+.ninja_*
+compile_commands.json
+
+# Compiled artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.profraw
+
+# LLVM Lit output
+**/test/Output/
+**/.lit_test_times.txt
+
+# Python and editor state
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+*~

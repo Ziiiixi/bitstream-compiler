@@ -1,0 +1,20 @@
+set(LLVM_TARGET_DEFINITIONS BitstreamDialect.td)
+mlir_tablegen(BitstreamDialect.h.inc -gen-dialect-decls -dialect=bitstream)
+mlir_tablegen(BitstreamDialect.cpp.inc -gen-dialect-defs -dialect=bitstream)
+add_public_tablegen_target(MLIRBitstreamDialectIncGen)
+
+set(LLVM_TARGET_DEFINITIONS BitstreamTypes.td)
+mlir_tablegen(BitstreamTypes.h.inc -gen-typedef-decls -typedefs-dialect=bitstream)
+mlir_tablegen(BitstreamTypes.cpp.inc -gen-typedef-defs -typedefs-dialect=bitstream)
+add_public_tablegen_target(MLIRBitstreamTypesIncGen)
+
+set(LLVM_TARGET_DEFINITIONS BitstreamOps.td)
+mlir_tablegen(BitstreamOpsEnums.h.inc -gen-enum-decls)
+mlir_tablegen(BitstreamOpsEnums.cpp.inc -gen-enum-defs)
+mlir_tablegen(BitstreamOps.h.inc -gen-op-decls)
+mlir_tablegen(BitstreamOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(MLIRBitstreamOpsIncGen)
+
+set(LLVM_TARGET_DEFINITIONS BitstreamPasses.td)
+mlir_tablegen(BitstreamPasses.h.inc -gen-pass-decls)
+add_public_tablegen_target(MLIRBitstreamPassesIncGen)
