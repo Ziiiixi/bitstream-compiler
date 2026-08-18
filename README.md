@@ -438,13 +438,3 @@ ninja -C build-bitstream-mlir check-bitstream
 bash mlir/bitstream/test/run_smoke_tests.sh
 ```
 
-## Relationship to related systems
-
-- **BitGen** compiles specialized bitstream/regex programs into GPU kernels.
-- **MPK** constructs and schedules mega-kernels for tensor programs.
-- **This project** starts from existing CUDA/C++ kernel pipelines and asks
-  whether their recovered cross-kernel memory dependencies permit ordinary or
-  finite-state speculative fusion.
-
-The project is therefore currently a dependence-and-legality compiler, not a
-replacement for the complete BitGen backend or MPK runtime.
