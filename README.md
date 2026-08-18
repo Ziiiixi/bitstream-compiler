@@ -1,6 +1,6 @@
 # Bitstream Compiler
 
-An MLIR compiler for analyzing multi-kernel GPU bitstream programs.
+An MLIR compiler (Learn from: https://github.com/AlexandreSinger/mlir-beginner-friendly-tutorial/tree/master) for analyzing multi-kernel GPU bitstream programs.
 Starting from CUDA/C++ lowered by Polygeist, it reconstructs byte-indexed
 memory accesses, discovers cross-kernel dependencies, proves when an
 unbounded dependency reduces to a finite state, and emits a speculative-fusion
