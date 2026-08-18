@@ -399,11 +399,3 @@ bash scripts/run-direct-index.sh bitgen /tmp/bitstream-bitgen-run
 
 The output directory must not already exist so that a previous compiler trace
 cannot be overwritten accidentally.
-
-### Tests
-
-```bash
-ninja -C build-bitstream-mlir check-bitstream
-bash mlir/bitstream/test/run_smoke_tests.sh
-```
-
