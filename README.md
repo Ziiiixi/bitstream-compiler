@@ -62,54 +62,205 @@ MLIR, or Polygeist.
 
 ## A complete cuJSON example
 
-The prepared cuJSON pipeline contains UTF validation, bitmap construction,
-escaped-quote detection, a quote-prefix scan, in-string detection, and the
-structural-bitmap endpoint.
+This walkthrough follows one dependency from the original escaped-quote C++
+loop through every compiler artifact. The relevant edge is the bitmap
+producer's write `a7` to the predecessor read `a11`. To keep the walkthrough
+readable, snippets omit unrelated operands and give descriptive names to some
+SSA values; the links below open the exact generated files.
 
-For an ordinary pointwise dependency, a producer writes the same logical word
-that a later stage reads. Dependence analysis records the exact half-open byte
-window:
+```mermaid
+flowchart LR
+    accTitle: cuJSON dependency transformation
+    accDescr: The escaped-quote predecessor dependency is followed from source C++ through generic MLIR, recovered access IR, dependency discovery, classification, finite-state proof, and fusion legality
 
-```mlir
-bitstream.dependency memory = raw
-  producer_access = "a8" consumer_access = "a12"
-  finite_state = none
-  producer_byte_window = affine_map<(d0) -> (d0 * 4, d0 * 4 + 4)>
+    source_cpp(["C++ backward walk"]) --> generic_mlir["01 Generic MLIR"]
+    generic_mlir --> access_ir["02 Access-set IR"]
+    access_ir --> raw_dependency["03 RAW dependency"]
+    raw_dependency --> classify_edge["04 Unbounded group"]
+    classify_edge --> prove_state["05 Domain-2 proof"]
+    prove_state --> fusion_legal(["06 Fusion legal"])
 ```
 
-The escaped-quote stage also walks backward through predecessor words. The
-consumer address is the block argument of an `scf.while`, so there is no fixed
-producer byte window:
+### Source C++
+
+The prepared driver first produces the backslash bitmap, then invokes escaped
+quote detection, the quote scan, and in-string detection:
+
+```cpp
+bitMapCreatorSimd(..., backslashes_GPU, quote_GPU, ...);
+findEscapedQuoteMerge_NEW(backslashes_GPU, quote_GPU, real_quote_GPU, ...);
+thrust_exclusive_scan_quote_count(quote_GPU, quote_GPU, total_padded_32);
+inStringFinderBaseline(real_quote_GPU, quote_GPU, in_string_GPU, ...);
+```
+
+Inside `findEscapedQuoteMerge_NEW`, word `k` may inspect every predecessor
+until it finds a word whose trailing-backslash parity is known:
+
+```cpp
+uint32_t overflow = 2u;
+int j = k - 1;
+while (overflow == 2u && j >= 0) {
+    uint32_t backslash_j = backslashes_GPU[j];
+    uint32_t trailing = static_cast<uint32_t>(__clz(~backslash_j));
+    overflow = (trailing == 32u) ? 2u : (trailing & 1u);
+    --j;
+}
+if (overflow == 2u) {
+    overflow = 0u;
+}
+```
+
+The complete source is in [`inputs/cujson/cujson.cpp`](inputs/cujson/cujson.cpp).
+
+### 01: Polygeist generic MLIR
+
+Polygeist lowers the source without introducing bitstream semantics. The
+complete loop still carries its loaded value, `j`, and `overflow`; the exit condition remains
+`overflow == 2 && j >= 0`. The following is abbreviated from
+[`01_generic_mlir.mlir`](analysis/cujson/01_generic_mlir.mlir):
+
+```mlir
+%39:4 = scf.while (... %arg26 = %38, %arg27 = %c2_i32) {
+  %is_unknown = arith.cmpi eq, %arg27, %c2_i32 : i32
+  %continue = scf.if %is_unknown -> i1 {
+    %in_range = arith.cmpi sge, %arg26, %c0_i32 : i32
+    scf.yield %in_range : i1
+  } else {
+    scf.yield %false : i1
+  }
+  scf.condition(%continue) ... %arg26, %arg27
+} do {
+^bb0(..., %j: i32, %overflow: i32):
+  %index = arith.index_cast %j : i32 to index
+  %word = affine.load %backslashes[%index] : memref<?xi32>
+  %not_word = arith.xori %word, %c-1_i32 : i32
+  %trailing = math.ctlz %not_word : i32
+  %parity = arith.andi %trailing, %c1_i32 : i32
+  %next_j = arith.addi %j, %c-1_i32 : i32
+  scf.yield ... %next_j, %parity
+}
+```
+
+At this point the IR is still ordinary Polygeist `func`, `scf`, `arith`,
+`affine`, and `memref` IR. It contains no bitstream dependency yet.
+
+### 02: Recovered bitstream access-set IR
+
+`RecoverSemantics.cpp` retains the possible predecessor addresses as an
+`scf.while`, assigns the concrete read ID `a11`, and preserves the final
+domain-2 projection derived from `~word → ctlz → & 1`:
+
+```mlir
+bitstream.kernel @bitMapCreatorSimd {
+  %logical = bitstream.logical_index : index
+  bitstream.write %backslashes[%logical] {
+    access_id = "a7", byte_index = #map1, bytes = 1 : i64
+  } : !bitstream.buffer
+  ...
+}
+
+bitstream.kernel @findEscapedQuoteMerge_NEW {
+%logical = bitstream.logical_index : index
+%c-1 = arith.constant -1 : index
+%first_predecessor = arith.addi %logical, %c-1 : index
+
+scf.while (%j = %first_predecessor) : (index) -> index {
+  %c0 = arith.constant 0 : index
+  %in_range = arith.cmpi sge, %j, %c0 : index
+  scf.condition(%in_range) %j : index
+} do {
+^bb0(%j: index):
+  bitstream.read %backslashes[%j] {
+    access_id = "a11", byte_index = #map, bytes = 4 : i64
+  } : !bitstream.buffer
+  bitstream.project_state %backslashes[%j] {
+    domain = 2 : i64, modulus = 2 : i64,
+    projection_kind = "ssa_not_ctlz_low_bit", read_access = "a11"
+  } : !bitstream.buffer
+  %next_j = arith.subi %j, %c1 : index
+  scf.yield %next_j : index
+}
+}
+```
+
+This is conservative access-analysis IR, not executable replacement code. It
+retains all possible predecessor locations while recording that the value
+needed after validation belongs to `{0, 1}`. See
+[`02_bitstream_raised.mlir`](analysis/cujson/02_bitstream_raised.mlir).
+
+### 03: Raw dependency discovery
+
+`DependenceAnalysis.cpp` matches the earlier bitmap write `a7` with read
+`a11`. Because `a11` is controlled by the decreasing loop variable `j`, the
+pass cannot construct one finite producer byte window:
 
 ```mlir
 bitstream.dependency memory = raw
   producer_access = "a7" consumer_access = "a11"
   finite_state = none
+  {buffer = @cujson_tokenizer_polygeist_raised::@arg3,
+   producer = @cujson_tokenizer_polygeist_raised::@_Z17bitMapCreatorSimdPjPhS0_S0_S0_yi,
+   consumer = @cujson_tokenizer_polygeist_raised::@_Z25findEscapedQuoteMerge_NEWPjS_S_iii}
 ```
 
-Recovery preserves an exact domain-2 projection of that read. Finite-state
-inference then changes only that concrete dependency:
+Notice that discovery starts with `finite_state = none`; the existence of a
+`project_state` is evidence, but the proof is performed later. See
+[`03_raw_dependencies.mlir`](analysis/cujson/03_raw_dependencies.mlir).
+
+### 04: Dependency classification
+
+`DependencyClassification.cpp` places edges with a finite
+`producer_byte_window` in the bounded group. Since `a7 → a11` has no such
+window, it enters the unbounded group without adding another classification
+attribute:
+
+```mlir
+bitstream.dependency_group kind = "unbounded" {
+  bitstream.dependency memory = raw
+    producer_access = "a7" consumer_access = "a11"
+    finite_state = none {...}
+}
+```
+
+See [`04_classified_dependencies.mlir`](analysis/cujson/04_classified_dependencies.mlir).
+
+### 05: Finite-state inference
+
+`FiniteStateInference.cpp` resolves `consumer_access = "a11"`, verifies that
+exact read's buffer and SSA index against its `project_state`, and records the
+two-state proof:
 
 ```mlir
 bitstream.dependency memory = raw
   producer_access = "a7" consumer_access = "a11"
   finite_state = proven finite_state_domain = 2
-  {states = [@cujson_tokenizer_polygeist_raised::...::@state0]}
+  {states = [@cujson_tokenizer_polygeist_raised::
+              @_Z25findEscapedQuoteMerge_NEWPjS_S_iii::@state0], ...}
 ```
 
-The quote scan-to-in-string edge is treated similarly: its index arithmetic is
-regular, but a scan result incorporates an arbitrarily long prefix, so the edge
-has no finite producer byte window. Its binary state projection makes the edge
-fusible.
+The same pass independently proves the domain-2 quote-scan state used by the
+in-string stage. See
+[`05_finite_state_proof.mlir`](analysis/cujson/05_finite_state_proof.mlir).
 
-The final pass reports the whole seven-stage cuJSON region as legal because
-every producer edge either has a finite byte window or an exact finite-state
-proof. See:
+### 06: Fusion legality
 
-- `analysis/cujson/02_bitstream_raised.mlir`
-- `analysis/cujson/03_raw_dependencies.mlir`
-- `analysis/cujson/05_finite_state_proof.mlir`
-- `analysis/cujson/06_fusion_legality.mlir`
+`SpeculativeFusion.cpp` now sees that every dependency either has a finite
+producer byte window or an exact finite-state proof:
+
+```mlir
+bitstream.fusion_candidate {
+  legal = true,
+  reason = "every dependency without a finite byte window has an exact finite-state proof; remaining dependencies have finite byte windows",
+  ...
+}
+bitstream.fused_kernel
+  @cujson_tokenizer_polygeist_raised_speculative_fusion_kernel
+  strategy = decoupled_lookback {...}
+```
+
+This descriptor is the current compiler endpoint; it does not yet contain the
+generated fused CUDA body. See
+[`06_fusion_legality.mlir`](analysis/cujson/06_fusion_legality.mlir).
 
 ## Repository structure
 
@@ -157,33 +308,8 @@ control.
 | Check fusion legality | `--bitstream-speculative-fusion` | `Transforms/SpeculativeFusion.cpp` | `06_fusion_legality.mlir` |
 
 All implementation paths in the table are relative to
-`mlir/bitstream/lib/Dialect/Bitstream/`.
-
-### How a command-line pass reaches its implementation
-
-```text
-BitstreamPasses.td
-  declares the flag and createBitstream...Pass() constructor
-        │
-        ▼
-MLIR TableGen generates BitstreamPasses.h.inc
-        │
-        ▼
-bitstream::registerPasses() exposes the command-line flag
-        │
-        ▼
-bitstream-opt.cpp registers the passes and required dialects
-        │
-        ▼
-MLIR constructs the pass and invokes runOnOperation()
-        │
-        ▼
-Transforms/<Pass>.cpp performs the transformation
-```
-
-`bitstream-opt` registers the available passes; it does not hardcode their
-order. `scripts/run-direct-index.sh` invokes them one at a time and saves the
-IR after each step.
+`mlir/bitstream/lib/Dialect/Bitstream/`. `scripts/run-direct-index.sh` invokes
+the passes one at a time and saves the IR after each step.
 
 ## Core IR contract
 
@@ -240,14 +366,21 @@ More detailed operation contracts are documented in
 
 ## Workloads and current trace results
 
-| Workload | Dependency edges | Dependency finite-state proofs | Final result |
-|---|---:|---:|---|
-| cuJSON tokenizer | 14 | 2 | legal speculative-fusion descriptor |
-| gpJSON | 13 | 1 bounded descriptive proof | legal finite-window descriptor |
-| BitGen regex example | 27 | 0 dependency proofs | legal regex-state descriptor |
+| Workload | Dependency edges | Edges without a finite byte window | Required dependency proofs | Final result |
+|---|---:|---:|---:|---|
+| cuJSON tokenizer | 14 | 2 | 2 | legal speculative-fusion descriptor |
+| gpJSON | 13 | 0 | 0 | legal finite-window descriptor |
+| BitGen regex example | 27 | 0 | 0 | legal regex-state descriptor |
 
 These counts describe the committed prepared inputs and should be regenerated
 when the compiler or inputs change.
+
+Finite-state inference additionally recognizes a domain-2 projection on the
+gpJSON edge `a18 → a19`. That edge already carries a
+`producer_byte_window`, so the projection is recorded in `05` but is not
+required to make fusion legal. The previous phrase “1 bounded descriptive
+proof” referred to this optional evidence; the table now reports only proofs
+required for edges that have no finite byte window.
 
 ## Build and run
 
@@ -299,12 +432,3 @@ bash mlir/bitstream/test/run_smoke_tests.sh
 
 The project is therefore currently a dependence-and-legality compiler, not a
 replacement for the complete BitGen backend or MPK runtime.
-
-## Licensing and provenance
-
-No project-wide license has been selected yet. The prepared workload inputs
-come from or are adapted from third-party research systems with different
-licensing status. See `THIRD_PARTY_NOTICES.md` before redistributing the
-repository. In particular, the retained BitGen-generated CUDA body should not
-be published in a public repository until its redistribution terms are
-confirmed or it is replaced by an independently written example.
