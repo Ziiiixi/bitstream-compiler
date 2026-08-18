@@ -388,16 +388,6 @@ More detailed operation contracts are documented in
 | gpJSON | 13 | 3 | 3 | legal speculative-fusion descriptor |
 | BitGen regex example | 27 | 0 | 0 | No descriptor |
 
-These counts describe the committed prepared inputs and should be regenerated
-when the compiler or inputs change.
-
-Finite-state inference additionally recognizes a domain-2 projection on the
-gpJSON edge `a18 → a19`. That edge already carries a
-`producer_byte_range`, so the projection is recorded in `05` but is not
-required to make fusion legal. The previous phrase “1 bounded descriptive
-proof” referred to this optional evidence; the table now reports only proofs
-required for edges that have no finite byte range.
-
 ## Build and run
 
 ### Prerequisites
