@@ -1,6 +1,6 @@
 # Bitstream Compiler
 
-An MLIR research compiler for analyzing multi-kernel GPU bitstream programs.
+An MLIR compiler for analyzing multi-kernel GPU bitstream programs.
 Starting from CUDA/C++ lowered by Polygeist, it reconstructs byte-indexed
 memory accesses, discovers cross-kernel dependencies, proves when an
 unbounded dependency reduces to a finite state, and emits a speculative-fusion
@@ -14,16 +14,16 @@ legality descriptor.
 
 Bitstream pipelines commonly split parsing or regular-expression work across
 multiple GPU kernels. Fusing those kernels is straightforward when every
-consumer needs a finite, statically known window of producer bytes. Prefix
-scans and data-dependent predecessor walks are harder: the set of possible
+consumer needs a finite, statically known range of producer bytes. Prefix
+scans and other unbounded range dependencies harder: the set of possible
 producer locations grows with the logical position, even when the information
 crossing the boundary is only a few bits.
 
 This compiler separates four questions:
 
-1. **Where does every stage read and write in bytes?**
-2. **Does a consumer require a finite producer byte window?**
-3. **If no finite window exists, can the dependency be projected to a finite
+1. **Where does every stage （kernels) read and write in bytes?**
+2. **Does a consumer require a finite producer byte range?**
+3. **If no finite range exists, can the dependency be projected to a finite
    state?**
 4. **Do those facts make the complete pipeline legal to fuse?**
 
@@ -44,7 +44,7 @@ prepared CUDA/C++ workload
 02  Conservative bitstream access-set and recurrence IR
         │ bitstream-dependence-analysis
         ▼
-03  RAW dependencies and finite byte-window witnesses
+03  RAW dependencies and finite byte-range witnesses
         │ bitstream-dependency-classification
         ▼
 04  Bounded and unbounded presentation groups
@@ -192,7 +192,7 @@ needed after validation belongs to `{0, 1}`. See
 
 `DependenceAnalysis.cpp` matches the earlier bitmap write `a7` with read
 `a11`. Because `a11` is controlled by the decreasing loop variable `j`, the
-pass cannot construct one finite producer byte window:
+pass cannot construct one finite producer byte range:
 
 ```mlir
 bitstream.dependency memory = raw
@@ -210,8 +210,8 @@ Notice that discovery starts with `finite_state = none`; the existence of a
 ### 04: Dependency classification
 
 `DependencyClassification.cpp` places edges with a finite
-`producer_byte_window` in the bounded group. Since `a7 → a11` has no such
-window, it enters the unbounded group without adding another classification
+`producer_byte_range` in the bounded group. Since `a7 → a11` has no such
+range, it enters the unbounded group without adding another classification
 attribute:
 
 ```mlir
@@ -245,12 +245,12 @@ in-string stage. See
 ### 06: Fusion legality
 
 `SpeculativeFusion.cpp` now sees that every dependency either has a finite
-producer byte window or an exact finite-state proof:
+producer byte range or an exact finite-state proof:
 
 ```mlir
 bitstream.fusion_candidate {
   legal = true,
-  reason = "every dependency without a finite byte window has an exact finite-state proof; remaining dependencies have finite byte windows",
+  reason = "every dependency without a finite byte range has an exact finite-state proof; remaining dependencies have finite byte ranges",
   ...
 }
 bitstream.fused_kernel
@@ -323,13 +323,13 @@ bitstream.scan @gpjson_xor_post_scan operator = "xor"
 
 An access inside `bitstream.recurrence` is not automatically unbounded. A read
 whose index is captured from outside the recurrence retains its finite byte
-window. A read whose SSA index reaches the recurrence-local
-`bitstream.logical_index` has no fixed producer window for the enclosing work
+range. A read whose SSA index reaches the recurrence-local
+`bitstream.logical_index` has no fixed producer range for the enclosing work
 item. Such a RAW edge is legal only when the recovered recurrence has a
 positive finite `state_domain`; finite-state inference marks the exact read
 with `state_kind = carried_state`.
 
-A value produced by global `bitstream.scan` also has no finite producer window.
+A value produced by global `bitstream.scan` also has no finite producer range.
 For the gpJSON scan-to-rebase edge, the proof is structural and exact:
 `ScanOp.state_domain = 2`, the write named by `producer_access` has
 `value_domain = 2`, and `consumer_access` resolves to the corresponding rebase
@@ -337,7 +337,7 @@ read. This path does not fabricate a `bitstream.project_state`.
 
 The current gpJSON trace therefore has three required domain-2 proofs:
 
-| Edge | Why no finite producer window | Proof source |
+| Edge | Why no finite producer range | Proof source |
 |---|---|---|
 | `a10 → a11` | `xor_pre_scan` reads a recurrence-varying carry index. | Local XOR recurrence with `state_domain = 2`. |
 | `a13 → a17` | `xor_rebase` consumes output from a global scan. | Scan domain and exact producer write `value_domain` both equal `2`. |
@@ -426,7 +426,7 @@ The physical interval is
 to the IDs of the real producer write and consumer read. There is no separate
 `bitstream.access`, dimension, iteration-domain, extent, or footprint summary.
 
-`producer_byte_window` is a two-result affine map describing the finite
+`producer_byte_range` is a two-result affine map describing the finite
 half-open producer interval needed by a consumer. Its presence is the bounded
 witness. Dependencies with a scan producer, a recurrence-varying read, or a
 loop-carried predecessor read have no such map and appear in the unbounded
@@ -463,8 +463,8 @@ More detailed operation contracts are documented in
   `i`, `j`, `k`, or `index`.
 - `02_bitstream_raised.mlir` is conservative access-analysis IR, not executable
   replacement code. Reconstructed loops over-approximate possible addresses.
-- A finite byte-window witness establishes ordinary local fusion legality.
-  An edge without a finite window requires an exact finite-state proof.
+- A finite byte-range witness establishes ordinary local fusion legality.
+  An edge without a finite range requires an exact finite-state proof.
 - The current compiler does not prove arbitrary transducer associativity. It
   preserves explicit loop-carried state, verifies its finite domain, and still
   requires exact access-linked evidence for dependency legality.
@@ -476,7 +476,7 @@ More detailed operation contracts are documented in
 
 ## Workloads and current trace results
 
-| Workload | Dependency edges | Edges without a finite byte window | Required dependency proofs | Final result |
+| Workload | Dependency edges | Edges without a finite byte range | Required dependency proofs | Final result |
 |---|---:|---:|---:|---|
 | cuJSON tokenizer | 14 | 2 | 2 | legal speculative-fusion descriptor |
 | gpJSON | 13 | 3 | 3 | legal decoupled-lookback descriptor |
@@ -487,10 +487,10 @@ when the compiler or inputs change.
 
 Finite-state inference additionally recognizes a domain-2 projection on the
 gpJSON edge `a18 → a19`. That edge already carries a
-`producer_byte_window`, so the projection is recorded in `05` but is not
+`producer_byte_range`, so the projection is recorded in `05` but is not
 required to make fusion legal. The previous phrase “1 bounded descriptive
 proof” referred to this optional evidence; the table now reports only proofs
-required for edges that have no finite byte window.
+required for edges that have no finite byte range.
 
 ## Build and run
 
