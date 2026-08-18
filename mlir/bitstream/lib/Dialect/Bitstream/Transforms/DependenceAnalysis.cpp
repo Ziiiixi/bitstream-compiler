@@ -393,9 +393,11 @@ static bool deriveDependencyWindow(PendingEdge &edge, ReadOp read,
 
   // A dynamically repeated read and a scan-produced value have no finite
   // producer window for one consumer coordinate, regardless of whether the
-  // individual address expression is affine.
+  // individual address expression is affine.  A local recurrence is treated
+  // this way only when the read index actually varies with its recovered
+  // logical recurrence coordinate; captured invariant accesses stay bounded.
   if ((!producerIsInput && producer && producer->isScan) ||
-      isEnclosedInWhile(read)) {
+      isEnclosedInWhile(read) || findVaryingRecurrence(read)) {
     edge.producerByteWindow.reset();
     return true;
   }
@@ -617,11 +619,12 @@ struct BitstreamDependenceAnalysisPass
                                       producerIsInput ? nullptr
                                                       : &producerIt->second)) {
             read.emitError()
-                << "cannot derive a bounded byte window or structural "
+                << "cannot derive a finite byte window or structural "
                    "unboundedness for this access: expected "
                    "a positive `bytes` and a structurally affine byte address "
                    "(including invariant coefficients), a read enclosed in "
-                   "scf.while, or a RAW edge produced by bitstream.scan";
+                   "scf.while, a recurrence-varying read, or a RAW edge "
+                   "produced by bitstream.scan";
             relationFailure = true;
             return;
           }
@@ -630,25 +633,30 @@ struct BitstreamDependenceAnalysisPass
 
         // Step 6: process writes after reads, then make them the latest
         // producers seen by later stages. This also handles in-place stages
-        // correctly.
+        // correctly. Select within the current stage first: prefer its
+        // steady-state write over a final boundary flush, but use the boundary
+        // write when it is the only write this stage performs.
+        llvm::StringMap<Producer> stageProducers;
+        llvm::StringMap<Producer> boundaryProducers;
         stage.walk([&](WriteOp write) {
           auto it = buffers.find(write.getBuffer());
           if (it == buffers.end()) {
             write.emitWarning() << "write uses an unknown bitstream buffer";
             return;
           }
-          // Tail epilogues such as out[(fileSize - 1) / 64] flush the final
-          // partial bitmap word. They should not replace the steady-state
-          // producer summary for out[i / 64]; otherwise every later read looks
-          // like it depends on only the tail location.
-          if (write.getOperation()->hasAttr("tail_boundary_write") &&
-              producers.find(it->second.name) != producers.end())
-            return;
-
-          producers[it->second.name] = Producer{
-              consumer, accessId(write.getOperation()), write.getIndex(),
-              write.getOperation(), isa<ScanOp>(&stage)};
+          Producer producer{consumer, accessId(write.getOperation()),
+                            write.getIndex(), write.getOperation(),
+                            isa<ScanOp>(&stage)};
+          if (write.getOperation()->hasAttr("tail_boundary_write"))
+            boundaryProducers[it->second.name] = std::move(producer);
+          else
+            stageProducers[it->second.name] = std::move(producer);
         });
+        for (auto &entry : boundaryProducers)
+          if (!stageProducers.count(entry.getKey()))
+            stageProducers[entry.getKey()] = std::move(entry.getValue());
+        for (auto &entry : stageProducers)
+          producers[entry.getKey()] = std::move(entry.getValue());
       }
 
       if (relationFailure) {

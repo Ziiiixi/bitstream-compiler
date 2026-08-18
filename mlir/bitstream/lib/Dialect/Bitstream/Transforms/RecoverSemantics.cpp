@@ -53,13 +53,40 @@ struct FunctionFacts {
   SmallVector<Fact> facts;
 };
 
+// Structural description of one source-level loop-carried state lane.  The
+// Bitstream access IR deliberately does not clone scalar SSA, so these values
+// are retained only while recovering the enclosing marker region and its
+// finite domain.
+struct RecoveredRecurrence {
+  int64_t id = -1;
+  Operation *sourceLoop = nullptr;
+  std::string combiner;
+  std::optional<int64_t> stateDomain;
+  std::optional<int64_t> initialState;
+  std::optional<int64_t> directInputDomain;
+  Value combinerInput;
+  SmallVector<Value, 4> stateRoots;
+  bool globalSerialPrefix = false;
+};
+
 struct AccessAction {
   llvm::StringMap<std::string> attrs;
+  // Recovery-only provenance used to distinguish a loop's steady writes from
+  // an epilogue that flushes its final carried value.  These pointers/values
+  // are never materialized as IR attributes.
+  Operation *sourceOp = nullptr;
+  Value accessedValue;
   // This is a recovery-time fact only.  It is derived from an enclosing
   // scf.while whose carried index walks backwards, and is never printed as an
   // attribute on a read/write.  Materialization reconstructs the conservative
   // access set as an scf.while with a loop-carried SSA index.
   bool hasUnboundedIteration = false;
+  // Source memory operations nested in a local state recurrence are emitted
+  // beneath the corresponding bitstream.recurrence marker.  Global serial
+  // recurrences instead become the containing bitstream.scan stage.
+  SmallVector<int64_t, 2> recurrencePath;
+  SmallVector<int64_t, 2> recurrenceInputs;
+  SmallVector<int64_t, 2> derivedFromRecurrences;
 };
 
 struct AccessStage {
@@ -67,6 +94,10 @@ struct AccessStage {
   std::string kind;
   std::string recoveryRule;
   SmallVector<AccessAction> actions;
+  SmallVector<RecoveredRecurrence> recurrences;
+  std::optional<std::string> combiner;
+  std::optional<int64_t> stateDomain;
+  std::optional<int64_t> initialState;
 };
 
 static StringRef getStringAttr(Operation *op, StringRef name,
@@ -1122,8 +1153,11 @@ static Value materializeExprLeaf(OpBuilder &builder, Location loc,
                                  IndexScope &scope, const AccessAction &record,
                                  StringRef prefix) {
   std::string kind = getAttr(record, attrKey(prefix, "_kind"));
-  if (kind == "logical")
+  if (kind == "logical") {
+    if (!scope.logicalIndex)
+      scope.logicalIndex = createLogicalIndex(builder, loc);
     return scope.logicalIndex;
+  }
   if (kind == "parameter") {
     std::optional<int64_t> sourceArg =
         parseInteger(getAttr(record, attrKey(prefix, "_source_arg")));
@@ -1226,7 +1260,9 @@ static void createIndexDef(OpBuilder &builder, Location loc, IndexScope &scope,
            (isGpuProduct("init_rhs") && isGpuLeaf("init_lhs", "thread_id"));
   };
 
-  if (scope.logicalIndex && isCudaLogicalIndex()) {
+  if (isCudaLogicalIndex()) {
+    if (!scope.logicalIndex)
+      scope.logicalIndex = createLogicalIndex(builder, loc);
     scope.named[name] = scope.logicalIndex;
     return;
   }
@@ -1251,8 +1287,31 @@ static Operation *createStageShell(OpBuilder &builder, Location loc,
                                 : KernelOp::getOperationName());
   state.addAttribute(SymbolTable::getSymbolAttrName(),
                      builder.getStringAttr(stage.name));
-  if (stage.kind == "scan")
-    state.addAttribute("combiner", builder.getStringAttr("add"));
+  if (stage.kind == "scan") {
+    state.addAttribute("combiner",
+                       builder.getStringAttr(stage.combiner.value_or("add")));
+    if (stage.stateDomain)
+      state.addAttribute("state_domain",
+                         builder.getI64IntegerAttr(*stage.stateDomain));
+    if (stage.initialState)
+      state.addAttribute("initial_state",
+                         builder.getI64IntegerAttr(*stage.initialState));
+  }
+  Region *region = state.addRegion();
+  region->push_back(new Block());
+  return builder.create(state);
+}
+
+static Operation *createRecurrenceShell(OpBuilder &builder, Location loc,
+                                        const RecoveredRecurrence &recurrence) {
+  OperationState state(loc, "bitstream.recurrence");
+  state.addAttribute("combiner", builder.getStringAttr(recurrence.combiner));
+  if (recurrence.stateDomain)
+    state.addAttribute("state_domain",
+                       builder.getI64IntegerAttr(*recurrence.stateDomain));
+  if (recurrence.initialState)
+    state.addAttribute("initial_state",
+                       builder.getI64IntegerAttr(*recurrence.initialState));
   Region *region = state.addRegion();
   region->push_back(new Block());
   return builder.create(state);
@@ -1479,28 +1538,84 @@ static std::string loopRootIndex(const AccessAction &record) {
   return "";
 }
 
-static void materializeActionsDirectly(OpBuilder &builder, Location loc,
-                                       const llvm::StringMap<Value> &buffers,
-                                       IndexScope &indices,
-                                       ArrayRef<AccessAction> actions) {
-  indices.parameterBlock = builder.getInsertionBlock();
-  indices.logicalIndex = createLogicalIndex(builder, loc);
-  for (size_t i = 0; i < actions.size(); ++i) {
+static const RecoveredRecurrence *findRecurrence(const AccessStage &stage,
+                                                 int64_t id) {
+  for (const RecoveredRecurrence &recurrence : stage.recurrences)
+    if (recurrence.id == id)
+      return &recurrence;
+  return nullptr;
+}
+
+static bool hasRecurrencePrefix(const AccessAction &action,
+                                ArrayRef<int64_t> prefix) {
+  return action.recurrencePath.size() >= prefix.size() &&
+         std::equal(prefix.begin(), prefix.end(),
+                    action.recurrencePath.begin());
+}
+
+static void materializeActionRange(OpBuilder &builder, Location loc,
+                                   const llvm::StringMap<Value> &buffers,
+                                   IndexScope &indices,
+                                   const AccessStage &stage,
+                                   ArrayRef<AccessAction> actions,
+                                   ArrayRef<int64_t> prefix) {
+  for (size_t i = 0; i < actions.size();) {
     const AccessAction &act = actions[i];
+    if (hasRecurrencePrefix(act, prefix) &&
+        act.recurrencePath.size() > prefix.size()) {
+      int64_t childId = act.recurrencePath[prefix.size()];
+      SmallVector<int64_t, 2> childPrefix(prefix.begin(), prefix.end());
+      childPrefix.push_back(childId);
+      size_t end = i + 1;
+      while (end < actions.size() &&
+             hasRecurrencePrefix(actions[end], childPrefix))
+        ++end;
+
+      if (const RecoveredRecurrence *recurrence =
+              findRecurrence(stage, childId)) {
+        Operation *recurrenceOp =
+            createRecurrenceShell(builder, loc, *recurrence);
+        OpBuilder recurrenceBuilder =
+            OpBuilder::atBlockEnd(&recurrenceOp->getRegion(0).front());
+        IndexScope recurrenceIndices = indices;
+        recurrenceIndices.logicalIndex = Value();
+        materializeActionRange(recurrenceBuilder, loc, buffers,
+                               recurrenceIndices, stage,
+                               actions.slice(i, end - i), childPrefix);
+        recurrenceBuilder.create<YieldOp>(loc);
+      } else {
+        materializeActionRange(builder, loc, buffers, indices, stage,
+                               actions.slice(i, end - i), childPrefix);
+      }
+      i = end;
+      continue;
+    }
+
     if (getAttr(act, "kind") == "read" && act.hasUnboundedIteration &&
         i + 1 < actions.size()) {
       const AccessAction &projection = actions[i + 1];
       if (getAttr(projection, "kind") == "state_projection" &&
+          projection.recurrencePath == act.recurrencePath &&
           projection.hasUnboundedIteration &&
           getAttr(projection, "buffer") == getAttr(act, "buffer") &&
           getAttr(projection, "index") == getAttr(act, "index")) {
         createRead(builder, loc, buffers, indices, act, &projection);
-        ++i;
+        i += 2;
         continue;
       }
     }
     materializeAction(builder, loc, buffers, indices, act);
+    ++i;
   }
+}
+
+static void materializeActionsDirectly(OpBuilder &builder, Location loc,
+                                       const llvm::StringMap<Value> &buffers,
+                                       IndexScope &indices,
+                                       const AccessStage &stage) {
+  indices.parameterBlock = builder.getInsertionBlock();
+  materializeActionRange(builder, loc, buffers, indices, stage, stage.actions,
+                         ArrayRef<int64_t>());
 }
 
 static bool isMaterializedIndexExpressionOp(Operation *op) {
@@ -3143,6 +3258,551 @@ static std::optional<int64_t> finiteValueDomain(Value value) {
   return finiteValueDomain(value, seen);
 }
 
+struct CombinerMatch {
+  std::string name;
+  Value input;
+  std::optional<int64_t> projectedStateDomain;
+};
+
+struct RecurrenceLaneMatch {
+  Value initial;
+  Value carried;
+  Value update;
+  Value result;
+  CombinerMatch combiner;
+};
+
+static bool sameValueThroughIntegerCasts(Value lhs, Value rhs) {
+  return stripIndexAndIntegerCasts(lhs) == stripIndexAndIntegerCasts(rhs);
+}
+
+// Keep the combiner recognizer intentionally structural and small.  Adding a
+// new associative state update is a local extension here; no source function
+// or variable names participate in recurrence recovery.
+static std::optional<CombinerMatch> matchStateCombiner(Value update,
+                                                       Value carried) {
+  update = stripIndexAndIntegerCasts(update);
+  carried = stripIndexAndIntegerCasts(carried);
+  if (!update || !carried)
+    return std::nullopt;
+
+  if (auto xori = update.getDefiningOp<arith::XOrIOp>()) {
+    if (sameValueThroughIntegerCasts(xori.getLhs(), carried))
+      return CombinerMatch{"xor", xori.getRhs(), std::nullopt};
+    if (sameValueThroughIntegerCasts(xori.getRhs(), carried))
+      return CombinerMatch{"xor", xori.getLhs(), std::nullopt};
+  }
+
+  // A word-at-a-time prefix XOR commonly carries only the projected boundary
+  // bit into the next word:
+  //   next = (wordPrefix xor carried) >> (bitwidth - 1)
+  // The projection has exactly two outcomes even when its entry state is a
+  // dynamic choice between the all-zero and all-one word.
+  if (auto shift = update.getDefiningOp<arith::ShRSIOp>()) {
+    auto type = dyn_cast<IntegerType>(shift.getLhs().getType());
+    std::optional<int64_t> amount = integerConstant(shift.getRhs());
+    auto xori = shift.getLhs().getDefiningOp<arith::XOrIOp>();
+    if (type && amount && *amount == type.getWidth() - 1 && xori) {
+      if (sameValueThroughIntegerCasts(xori.getLhs(), carried))
+        return CombinerMatch{"xor", xori.getRhs(), 2};
+      if (sameValueThroughIntegerCasts(xori.getRhs(), carried))
+        return CombinerMatch{"xor", xori.getLhs(), 2};
+    }
+  }
+  if (auto shift = update.getDefiningOp<arith::ShRUIOp>()) {
+    auto type = dyn_cast<IntegerType>(shift.getLhs().getType());
+    std::optional<int64_t> amount = integerConstant(shift.getRhs());
+    auto xori = shift.getLhs().getDefiningOp<arith::XOrIOp>();
+    if (type && amount && *amount == type.getWidth() - 1 && xori) {
+      if (sameValueThroughIntegerCasts(xori.getLhs(), carried))
+        return CombinerMatch{"xor", xori.getRhs(), 2};
+      if (sameValueThroughIntegerCasts(xori.getRhs(), carried))
+        return CombinerMatch{"xor", xori.getLhs(), 2};
+    }
+  }
+  if (auto andi = update.getDefiningOp<arith::AndIOp>()) {
+    Value projected = isOneConstant(andi.getLhs())   ? andi.getRhs()
+                      : isOneConstant(andi.getRhs()) ? andi.getLhs()
+                                                     : Value();
+    auto xori = projected ? projected.getDefiningOp<arith::XOrIOp>() : nullptr;
+    if (xori) {
+      if (sameValueThroughIntegerCasts(xori.getLhs(), carried))
+        return CombinerMatch{"xor", xori.getRhs(), 2};
+      if (sameValueThroughIntegerCasts(xori.getRhs(), carried))
+        return CombinerMatch{"xor", xori.getLhs(), 2};
+    }
+  }
+  return std::nullopt;
+}
+
+static bool operationIsWithin(Operation *op, Operation *ancestor) {
+  for (Operation *current = op; current; current = current->getParentOp())
+    if (current == ancestor)
+      return true;
+  return false;
+}
+
+static unsigned operationNestingDepth(Operation *op) {
+  unsigned depth = 0;
+  for (; op; op = op->getParentOp())
+    ++depth;
+  return depth;
+}
+
+static bool valueTransitivelyDependsOn(Value value, Value root,
+                                       llvm::SmallPtrSetImpl<Value> &seen,
+                                       unsigned depth = 0) {
+  if (!value || !root || depth > 24)
+    return false;
+  if (value == root || sameValueThroughIntegerCasts(value, root))
+    return true;
+  value = stripIndexAndIntegerCasts(value);
+  if (!value || !seen.insert(value).second || isa<BlockArgument>(value))
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  // A loop result is an opaque recurrence boundary here.  Exact loop results
+  // are matched above; walking all loop operands would incorrectly make every
+  // result depend on every carried lane.
+  if (isa<scf::ForOp, scf::WhileOp>(def))
+    return false;
+  for (Value operand : def->getOperands())
+    if (valueTransitivelyDependsOn(operand, root, seen, depth + 1))
+      return true;
+  return false;
+}
+
+static bool valueTransitivelyDependsOn(Value value, Value root) {
+  llvm::SmallPtrSet<Value, 16> seen;
+  return valueTransitivelyDependsOn(value, root, seen);
+}
+
+static bool valueContainsMemoryRead(Value value,
+                                    llvm::SmallPtrSetImpl<Value> &seen,
+                                    unsigned depth = 0) {
+  value = stripIndexAndIntegerCasts(value);
+  if (!value || depth > 24 || !seen.insert(value).second ||
+      isa<BlockArgument>(value))
+    return false;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (isa<memref::LoadOp, affine::AffineLoadOp>(def) ||
+      def->getName().getStringRef() == "llvm.load")
+    return true;
+  if (isa<scf::ForOp, scf::WhileOp>(def))
+    return false;
+  for (Value operand : def->getOperands())
+    if (valueContainsMemoryRead(operand, seen, depth + 1))
+      return true;
+  return false;
+}
+
+static bool valueContainsMemoryRead(Value value) {
+  llvm::SmallPtrSet<Value, 16> seen;
+  return valueContainsMemoryRead(value, seen);
+}
+
+static bool valueDependsOnCudaScheduling(Value value,
+                                         GenericRaisingContext &ctx,
+                                         llvm::SmallPtrSetImpl<Value> &seen,
+                                         unsigned depth = 0) {
+  value = stripIndexAndIntegerCasts(resolveAlias(value, ctx));
+  if (!value || depth > 32 || !seen.insert(value).second)
+    return false;
+  if (isCudaGlobalThreadIndex(value, ctx) ||
+      isPolygeistGpuGlobalLoad(value, "blockIdx") ||
+      isPolygeistGpuGlobalLoad(value, "threadIdx") ||
+      isa_and_nonnull<gpu::BlockIdOp, gpu::ThreadIdOp>(value.getDefiningOp()))
+    return true;
+  if (isa<BlockArgument>(value))
+    return isSelectedPrimaryCoordinate(value, ctx);
+  Operation *def = value.getDefiningOp();
+  if (!def || isa<memref::LoadOp, affine::AffineLoadOp>(def) ||
+      def->getName().getStringRef() == "llvm.load")
+    return false;
+  for (Value operand : def->getOperands())
+    if (valueDependsOnCudaScheduling(operand, ctx, seen, depth + 1))
+      return true;
+  return false;
+}
+
+static bool valueDependsOnCudaScheduling(Value value,
+                                         GenericRaisingContext &ctx) {
+  llvm::SmallPtrSet<Value, 32> seen;
+  return valueDependsOnCudaScheduling(value, ctx, seen);
+}
+
+static bool recurrenceLoopDependsOnCudaScheduling(Operation *loop,
+                                                  GenericRaisingContext &ctx) {
+  if (!loop)
+    return false;
+
+  // An inner state recurrence nested under the selected CUDA scheduling loop
+  // is local even when its own bounds are constants.
+  if (ctx.logicalLoop && ctx.logicalLoop != loop &&
+      operationIsWithin(loop, ctx.logicalLoop))
+    return true;
+
+  if (auto forLoop = dyn_cast<scf::ForOp>(loop)) {
+    if (isProvenCudaGridStrideLoop(forLoop, ctx))
+      return true;
+    return valueDependsOnCudaScheduling(forLoop.getLowerBound(), ctx) ||
+           valueDependsOnCudaScheduling(forLoop.getUpperBound(), ctx) ||
+           valueDependsOnCudaScheduling(forLoop.getStep(), ctx);
+  }
+  if (auto whileLoop = dyn_cast<scf::WhileOp>(loop)) {
+    for (Value operand : whileLoop->getOperands())
+      if (valueDependsOnCudaScheduling(operand, ctx))
+        return true;
+  }
+  return false;
+}
+
+static void addRecoveredRecurrence(AccessStage &stage, Operation *loop,
+                                   Value initial, Value carried, Value update,
+                                   Value result, CombinerMatch match,
+                                   GenericRaisingContext &ctx) {
+  RecoveredRecurrence recurrence;
+  recurrence.id = static_cast<int64_t>(stage.recurrences.size());
+  recurrence.sourceLoop = loop;
+  recurrence.combiner = std::move(match.name);
+  recurrence.combinerInput = match.input;
+  recurrence.initialState = integerConstant(initial);
+  recurrence.directInputDomain = finiteValueDomain(match.input);
+  recurrence.stateRoots.append({carried, update, result});
+  recurrence.stateDomain = match.projectedStateDomain;
+  if (!recurrence.stateDomain && recurrence.initialState &&
+      recurrence.directInputDomain == 2 &&
+      (*recurrence.initialState == 0 || *recurrence.initialState == 1))
+    recurrence.stateDomain = 2;
+
+  // A recurrence driven by a memory value and independent of CUDA block/thread
+  // scheduling is the serial prefix represented by the whole stage.  Local
+  // per-thread sweeps remain marker regions inside a kernel.
+  recurrence.globalSerialPrefix =
+      !recurrenceLoopDependsOnCudaScheduling(loop, ctx) &&
+      valueContainsMemoryRead(match.input);
+  stage.recurrences.push_back(std::move(recurrence));
+
+  const RecoveredRecurrence &saved = stage.recurrences.back();
+  if (!saved.globalSerialPrefix)
+    return;
+  if (stage.combiner && *stage.combiner != saved.combiner)
+    return;
+  stage.kind = "scan";
+  stage.combiner = saved.combiner;
+  stage.initialState = saved.initialState;
+  stage.stateDomain = saved.stateDomain;
+}
+
+// Multiple independently carried state lanes in one source loop are a tuple
+// recurrence, not nested loops.  Until the IR models tuple state explicitly,
+// retain one structural marker without a finite-domain claim.  This keeps its
+// accesses unbounded while preventing an unsound domain-2 proof for the joint
+// state.
+static void addDomainlessTupleRecurrence(AccessStage &stage, Operation *loop,
+                                         ArrayRef<RecurrenceLaneMatch> lanes,
+                                         GenericRaisingContext &ctx) {
+  RecoveredRecurrence recurrence;
+  recurrence.id = static_cast<int64_t>(stage.recurrences.size());
+  recurrence.sourceLoop = loop;
+  recurrence.combiner = "tuple";
+  for (const RecurrenceLaneMatch &lane : lanes)
+    recurrence.stateRoots.append({lane.carried, lane.update, lane.result});
+  recurrence.globalSerialPrefix =
+      !recurrenceLoopDependsOnCudaScheduling(loop, ctx) &&
+      llvm::any_of(lanes, [](const RecurrenceLaneMatch &lane) {
+        return valueContainsMemoryRead(lane.combiner.input);
+      });
+  stage.recurrences.push_back(std::move(recurrence));
+
+  if (!stage.recurrences.back().globalSerialPrefix)
+    return;
+  stage.kind = "scan";
+  stage.combiner = "tuple";
+  stage.initialState.reset();
+  stage.stateDomain.reset();
+}
+
+static void discoverForRecurrences(scf::ForOp loop, AccessStage &stage,
+                                   GenericRaisingContext &ctx) {
+  if (!loop || loop.getRegion().empty())
+    return;
+  Block &body = loop.getRegion().front();
+  Operation *yield = body.getTerminator();
+  unsigned lanes = loop->getNumResults();
+  if (!yield || !isa<scf::YieldOp>(yield) ||
+      loop->getNumOperands() < 3 + lanes ||
+      body.getNumArguments() < 1 + lanes || yield->getNumOperands() < lanes)
+    return;
+
+  SmallVector<RecurrenceLaneMatch, 2> matches;
+  for (unsigned lane = 0; lane < lanes; ++lane) {
+    Value carried = body.getArgument(1 + lane);
+    Value update = yield->getOperand(lane);
+    std::optional<CombinerMatch> match = matchStateCombiner(update, carried);
+    if (!match)
+      continue;
+    matches.push_back(RecurrenceLaneMatch{loop->getOperand(3 + lane), carried,
+                                          update, loop->getResult(lane),
+                                          std::move(*match)});
+  }
+  if (matches.size() == 1) {
+    RecurrenceLaneMatch &lane = matches.front();
+    addRecoveredRecurrence(stage, loop.getOperation(), lane.initial,
+                           lane.carried, lane.update, lane.result,
+                           std::move(lane.combiner), ctx);
+  } else if (matches.size() > 1) {
+    addDomainlessTupleRecurrence(stage, loop.getOperation(), matches, ctx);
+  }
+}
+
+static void discoverWhileRecurrences(scf::WhileOp loop, AccessStage &stage,
+                                     GenericRaisingContext &ctx) {
+  if (!loop || loop->getNumRegions() != 2 || loop.getBefore().empty() ||
+      loop.getAfter().empty())
+    return;
+  Block &before = loop.getBefore().front();
+  Block &after = loop.getAfter().front();
+  Operation *condition = before.getTerminator();
+  Operation *yield = after.getTerminator();
+  unsigned beforeLanes = before.getNumArguments();
+  unsigned afterLanes = after.getNumArguments();
+  if (!condition || condition->getName().getStringRef() != "scf.condition" ||
+      !yield || !isa<scf::YieldOp>(yield) ||
+      condition->getNumOperands() != afterLanes + 1 ||
+      loop->getNumOperands() < beforeLanes ||
+      yield->getNumOperands() < beforeLanes ||
+      loop->getNumResults() < afterLanes)
+    return;
+
+  SmallVector<RecurrenceLaneMatch, 2> matches;
+  // scf.condition may permute lanes between the before and after regions.
+  // Match the payload structurally rather than assuming equal lane numbers.
+  for (unsigned beforeLane = 0; beforeLane < beforeLanes; ++beforeLane) {
+    Value beforeArg = before.getArgument(beforeLane);
+    for (unsigned afterLane = 0; afterLane < afterLanes; ++afterLane) {
+      if (!sameValueThroughIntegerCasts(condition->getOperand(afterLane + 1),
+                                        beforeArg))
+        continue;
+      Value carried = after.getArgument(afterLane);
+      Value update = yield->getOperand(beforeLane);
+      std::optional<CombinerMatch> match = matchStateCombiner(update, carried);
+      if (!match)
+        continue;
+      matches.push_back(
+          RecurrenceLaneMatch{loop->getOperand(beforeLane), carried, update,
+                              loop->getResult(afterLane), std::move(*match)});
+    }
+  }
+  if (matches.size() == 1) {
+    RecurrenceLaneMatch &lane = matches.front();
+    addRecoveredRecurrence(stage, loop.getOperation(), lane.initial,
+                           lane.carried, lane.update, lane.result,
+                           std::move(lane.combiner), ctx);
+  } else if (matches.size() > 1) {
+    addDomainlessTupleRecurrence(stage, loop.getOperation(), matches, ctx);
+  }
+}
+
+static void discoverStructuredRecurrences(Operation *root, AccessStage &stage,
+                                          GenericRaisingContext &ctx) {
+  root->walk([&](Operation *op) {
+    if (isInsideKnownDeadIf(op, ctx))
+      return;
+    if (auto loop = dyn_cast<scf::ForOp>(op))
+      discoverForRecurrences(loop, stage, ctx);
+    else if (auto loop = dyn_cast<scf::WhileOp>(op))
+      discoverWhileRecurrences(loop, stage, ctx);
+  });
+}
+
+static void attachRecurrenceFacts(AccessAction &record, Operation *sourceOp,
+                                  Value loadedValue, Value storedValue,
+                                  const AccessStage &stage) {
+  if (!sourceOp)
+    return;
+
+  SmallVector<std::pair<unsigned, int64_t>, 2> localMembership;
+  for (const RecoveredRecurrence &recurrence : stage.recurrences) {
+    if (!recurrence.globalSerialPrefix &&
+        operationIsWithin(sourceOp, recurrence.sourceLoop))
+      localMembership.push_back(
+          {operationNestingDepth(recurrence.sourceLoop), recurrence.id});
+
+    if (loadedValue && recurrence.combinerInput &&
+        valueTransitivelyDependsOn(recurrence.combinerInput, loadedValue))
+      record.recurrenceInputs.push_back(recurrence.id);
+
+    if (storedValue) {
+      for (Value stateRoot : recurrence.stateRoots) {
+        if (!sameValueThroughIntegerCasts(storedValue, stateRoot))
+          continue;
+        record.derivedFromRecurrences.push_back(recurrence.id);
+        if (recurrence.globalSerialPrefix &&
+            getAttr(record, "kind") == "write" &&
+            !operationIsWithin(sourceOp, recurrence.sourceLoop))
+          record.attrs["tail_boundary_write"] = "true";
+        break;
+      }
+    }
+  }
+  llvm::sort(localMembership,
+             [](auto lhs, auto rhs) { return lhs.first < rhs.first; });
+  for (auto [depth, id] : localMembership) {
+    (void)depth;
+    record.recurrencePath.push_back(id);
+  }
+}
+
+// A write after a loop is a boundary flush when (1) it stores a value derived
+// from that loop's result and (2) the same buffer and element width are also
+// written inside the loop.  This captures partial-word and final-prefix
+// epilogues without relying on source names or spelling an index such as
+// `(size - 1) / 64`.
+static void markLoopBoundaryWrites(Operation *root, AccessStage &stage) {
+  root->walk([&](Operation *loop) {
+    if (!isa<scf::ForOp, scf::WhileOp>(loop) || loop->getNumResults() == 0)
+      return;
+
+    for (AccessAction &boundary : stage.actions) {
+      if (getAttr(boundary, "kind") != "write" || !boundary.sourceOp ||
+          !boundary.accessedValue || operationIsWithin(boundary.sourceOp, loop))
+        continue;
+
+      // A second loop seeded from the first loop's result is another steady
+      // computation, not a one-shot epilogue.  A true boundary flush may be
+      // control-dependent (for example under scf.if) but is not repeated by a
+      // different loop.
+      bool nestedInOtherLoop = false;
+      for (Operation *parent = boundary.sourceOp->getParentOp();
+           parent && parent != root; parent = parent->getParentOp()) {
+        if (isLoopOperation(parent)) {
+          nestedInOtherLoop = true;
+          break;
+        }
+      }
+      if (nestedInOtherLoop)
+        continue;
+
+      bool storesLoopResult =
+          llvm::any_of(loop->getResults(), [&](Value result) {
+            return valueTransitivelyDependsOn(boundary.accessedValue, result);
+          });
+      if (!storesLoopResult)
+        continue;
+
+      bool hasSteadyWrite =
+          llvm::any_of(stage.actions, [&](const AccessAction &candidate) {
+            return &candidate != &boundary &&
+                   getAttr(candidate, "kind") == "write" &&
+                   getAttr(candidate, "buffer") ==
+                       getAttr(boundary, "buffer") &&
+                   getAttr(candidate, "bytes") == getAttr(boundary, "bytes") &&
+                   candidate.sourceOp &&
+                   operationIsWithin(candidate.sourceOp, loop);
+          });
+      if (hasSteadyWrite)
+        boundary.attrs["tail_boundary_write"] = "true";
+    }
+  });
+}
+
+static void appendRecurrenceIds(std::string &key, StringRef label,
+                                ArrayRef<int64_t> ids) {
+  key += label.str();
+  for (int64_t id : ids)
+    key += (Twine(".") + Twine(id)).str();
+}
+
+static bool containsRecurrenceId(ArrayRef<int64_t> ids, int64_t id) {
+  return llvm::is_contained(ids, id);
+}
+
+// Propagate only domains justified by the recovered dataflow.  In particular,
+// XOR preserves the binary domain when its initial state and every dynamic
+// combiner input are binary.  This carries quoteCarryIndex's domain through
+// gpJSON's local pre-scan and then through its global post-scan without using
+// source names.
+static void propagateRecurrenceDomains(MutableArrayRef<AccessStage> stages) {
+  llvm::StringMap<int64_t> bufferDomains;
+
+  for (AccessStage &stage : stages) {
+    for (RecoveredRecurrence &recurrence : stage.recurrences) {
+      bool sawInput = recurrence.directInputDomain.has_value();
+      bool inputsAreBinary =
+          !recurrence.directInputDomain || *recurrence.directInputDomain == 2;
+      for (const AccessAction &record : stage.actions) {
+        if (!containsRecurrenceId(record.recurrenceInputs, recurrence.id))
+          continue;
+        sawInput = true;
+        auto known = bufferDomains.find(getAttr(record, "buffer"));
+        if (known == bufferDomains.end() || known->second != 2)
+          inputsAreBinary = false;
+      }
+
+      if (!recurrence.stateDomain && recurrence.combiner == "xor" &&
+          recurrence.initialState &&
+          (*recurrence.initialState == 0 || *recurrence.initialState == 1) &&
+          sawInput && inputsAreBinary)
+        recurrence.stateDomain = 2;
+
+      if (!recurrence.stateDomain)
+        continue;
+      for (AccessAction &record : stage.actions)
+        if (getAttr(record, "kind") == "write" &&
+            containsRecurrenceId(record.derivedFromRecurrences, recurrence.id))
+          record.attrs["value_domain"] =
+              std::to_string(*recurrence.stateDomain);
+    }
+
+    SmallVector<const RecoveredRecurrence *, 2> globalRecurrences;
+    for (const RecoveredRecurrence &recurrence : stage.recurrences)
+      if (recurrence.globalSerialPrefix)
+        globalRecurrences.push_back(&recurrence);
+    if (globalRecurrences.size() == 1) {
+      const RecoveredRecurrence &recurrence = *globalRecurrences.front();
+      stage.kind = "scan";
+      stage.combiner = recurrence.combiner;
+      stage.initialState = recurrence.initialState;
+      stage.stateDomain = recurrence.stateDomain;
+    } else if (globalRecurrences.size() > 1) {
+      // Several serial state recurrences in one source stage form a tuple.
+      // Do not retain a scalar domain inferred for only the last lane/loop.
+      stage.kind = "scan";
+      stage.combiner = "tuple";
+      stage.initialState.reset();
+      stage.stateDomain.reset();
+    }
+
+    llvm::StringMap<bool> hasUnknownWrite;
+    llvm::StringMap<int64_t> writtenDomain;
+    for (const AccessAction &record : stage.actions) {
+      if (getAttr(record, "kind") != "write")
+        continue;
+      std::string buffer = getAttr(record, "buffer");
+      std::optional<int64_t> domain =
+          parseInteger(getAttr(record, "value_domain"));
+      if (!domain) {
+        hasUnknownWrite[buffer] = true;
+        continue;
+      }
+      auto previous = writtenDomain.find(buffer);
+      if (previous == writtenDomain.end())
+        writtenDomain[buffer] = *domain;
+      else if (previous->second != *domain)
+        hasUnknownWrite[buffer] = true;
+    }
+    for (const auto &entry : hasUnknownWrite)
+      bufferDomains.erase(entry.getKey());
+    for (const auto &entry : writtenDomain)
+      if (!hasUnknownWrite.lookup(entry.getKey()))
+        bufferDomains[entry.getKey()] = entry.getValue();
+  }
+}
+
 static void copyMlirAffineDependenceAttrs(AccessAction &record,
                                           Operation *sourceOp) {
   if (!sourceOp)
@@ -3164,7 +3824,8 @@ static void addGenericAccess(AccessStage &stage, llvm::StringSet<> &seen,
                              GenericRaisingContext &ctx,
                              bool noExactReadEscapes = false,
                              std::optional<int64_t> valueDomain = std::nullopt,
-                             Operation *sourceOp = nullptr) {
+                             Operation *sourceOp = nullptr,
+                             Value accessedValue = Value()) {
   if (buffer.empty() || !index)
     return;
   AccessAction record = action({{"kind", kind.str()},
@@ -3172,6 +3833,8 @@ static void addGenericAccess(AccessStage &stage, llvm::StringSet<> &seen,
                                 {"index", getOrCreateValueName(ctx, index)},
                                 {"bytes", std::to_string(bytes)},
                                 {"meaning", meaning.str()}});
+  record.sourceOp = sourceOp;
+  record.accessedValue = accessedValue;
   fillIndexAttrsFromValue(record, "index", index, ctx);
   (void)noExactReadEscapes;
   if (Value seed = dataDependentBackwardWalkSeed(index)) {
@@ -3181,22 +3844,27 @@ static void addGenericAccess(AccessStage &stage, llvm::StringSet<> &seen,
   if (valueDomain)
     record.attrs["value_domain"] = std::to_string(*valueDomain);
   copyMlirAffineDependenceAttrs(record, sourceOp);
+  attachRecurrenceFacts(record, sourceOp,
+                        kind == "read" ? accessedValue : Value(),
+                        kind == "write" ? accessedValue : Value(), stage);
   std::string key = kind.str() + "|" + buffer.str() + "|" +
                     getAttr(record, "index") + "|" + std::to_string(bytes);
+  appendRecurrenceIds(key, "|path", record.recurrencePath);
+  appendRecurrenceIds(key, "|input", record.recurrenceInputs);
+  appendRecurrenceIds(key, "|derived", record.derivedFromRecurrences);
   if (seen.contains(key))
     return;
   seen.insert(key);
   stage.actions.push_back(std::move(record));
 }
 
-static void
-addGenericAffineAccess(AccessStage &stage, llvm::StringSet<> &seen,
-                       StringRef kind, StringRef buffer, AffineMap map,
-                       ValueRange operands, int64_t bytes, StringRef meaning,
-                       GenericRaisingContext &ctx,
-                       bool noExactReadEscapes = false,
-                       std::optional<int64_t> valueDomain = std::nullopt,
-                       Operation *sourceOp = nullptr) {
+static void addGenericAffineAccess(
+    AccessStage &stage, llvm::StringSet<> &seen, StringRef kind,
+    StringRef buffer, AffineMap map, ValueRange operands, int64_t bytes,
+    StringRef meaning, GenericRaisingContext &ctx,
+    bool noExactReadEscapes = false,
+    std::optional<int64_t> valueDomain = std::nullopt,
+    Operation *sourceOp = nullptr, Value accessedValue = Value()) {
   if (buffer.empty() || map.getNumResults() == 0)
     return;
   AffineExpr expr = map.getResult(0);
@@ -3206,13 +3874,21 @@ addGenericAffineAccess(AccessStage &stage, llvm::StringSet<> &seen,
                                 {"index", indexName},
                                 {"bytes", std::to_string(bytes)},
                                 {"meaning", meaning.str()}});
+  record.sourceOp = sourceOp;
+  record.accessedValue = accessedValue;
   fillIndexAttrsFromAffineExpr(record, "index", expr, operands, ctx);
   (void)noExactReadEscapes;
   if (valueDomain)
     record.attrs["value_domain"] = std::to_string(*valueDomain);
   copyMlirAffineDependenceAttrs(record, sourceOp);
+  attachRecurrenceFacts(record, sourceOp,
+                        kind == "read" ? accessedValue : Value(),
+                        kind == "write" ? accessedValue : Value(), stage);
   std::string key = kind.str() + "|" + buffer.str() + "|" +
                     getAttr(record, "index") + "|" + std::to_string(bytes);
+  appendRecurrenceIds(key, "|path", record.recurrencePath);
+  appendRecurrenceIds(key, "|input", record.recurrenceInputs);
+  appendRecurrenceIds(key, "|derived", record.derivedFromRecurrences);
   if (seen.contains(key))
     return;
   seen.insert(key);
@@ -3225,7 +3901,7 @@ static void addGenericAccessWithIndexTerms(
     StringRef meaning, GenericRaisingContext &ctx,
     bool noExactReadEscapes = false,
     std::optional<int64_t> valueDomain = std::nullopt,
-    Operation *sourceOp = nullptr) {
+    Operation *sourceOp = nullptr, Value accessedValue = Value()) {
   if (buffer.empty())
     return;
   AccessAction record = action({{"kind", kind.str()},
@@ -3233,6 +3909,8 @@ static void addGenericAccessWithIndexTerms(
                                 {"index", indexTermsName(indexTerms, ctx)},
                                 {"bytes", std::to_string(bytes)},
                                 {"meaning", meaning.str()}});
+  record.sourceOp = sourceOp;
+  record.accessedValue = accessedValue;
   fillIndexAttrsFromTerms(record, "index", indexTerms, ctx);
   (void)noExactReadEscapes;
   if (Value seed = dataDependentBackwardWalkSeed(indexTerms)) {
@@ -3242,8 +3920,14 @@ static void addGenericAccessWithIndexTerms(
   if (valueDomain)
     record.attrs["value_domain"] = std::to_string(*valueDomain);
   copyMlirAffineDependenceAttrs(record, sourceOp);
+  attachRecurrenceFacts(record, sourceOp,
+                        kind == "read" ? accessedValue : Value(),
+                        kind == "write" ? accessedValue : Value(), stage);
   std::string key = kind.str() + "|" + buffer.str() + "|" +
                     getAttr(record, "index") + "|" + std::to_string(bytes);
+  appendRecurrenceIds(key, "|path", record.recurrencePath);
+  appendRecurrenceIds(key, "|input", record.recurrenceInputs);
+  appendRecurrenceIds(key, "|derived", record.derivedFromRecurrences);
   if (seen.contains(key))
     return;
   seen.insert(key);
@@ -3253,7 +3937,9 @@ static void addGenericAccessWithIndexTerms(
 static void addGenericStateProjection(AccessStage &stage,
                                       llvm::StringSet<> &seen, StringRef buffer,
                                       Value index, GenericRaisingContext &ctx,
-                                      StringRef projectionKind = StringRef()) {
+                                      StringRef projectionKind = StringRef(),
+                                      Operation *sourceOp = nullptr,
+                                      Value loadedValue = Value()) {
   AccessAction projection = action({{"kind", "state_projection"},
                                     {"buffer", buffer.str()},
                                     {"index", getOrCreateValueName(ctx, index)},
@@ -3264,8 +3950,10 @@ static void addGenericStateProjection(AccessStage &stage,
     projection.attrs["projection_kind"] = projectionKind.str();
   if (isDataDependentBackwardWalkIndex(index))
     markUnboundedIteration(projection);
+  attachRecurrenceFacts(projection, sourceOp, loadedValue, Value(), stage);
   std::string key =
       buffer.str() + "|" + getAttr(projection, "index") + "|domain2";
+  appendRecurrenceIds(key, "|path", projection.recurrencePath);
   if (seen.contains(key))
     return;
   seen.insert(key);
@@ -3275,7 +3963,8 @@ static void addGenericStateProjection(AccessStage &stage,
 static void addGenericStateProjectionWithIndexTerms(
     AccessStage &stage, llvm::StringSet<> &seen, StringRef buffer,
     ArrayRef<Value> indexTerms, GenericRaisingContext &ctx,
-    StringRef projectionKind = StringRef()) {
+    StringRef projectionKind = StringRef(), Operation *sourceOp = nullptr,
+    Value loadedValue = Value()) {
   AccessAction projection = action({{"kind", "state_projection"},
                                     {"buffer", buffer.str()},
                                     {"index", indexTermsName(indexTerms, ctx)},
@@ -3286,19 +3975,21 @@ static void addGenericStateProjectionWithIndexTerms(
     projection.attrs["projection_kind"] = projectionKind.str();
   if (hasDataDependentBackwardWalkIndex(indexTerms))
     markUnboundedIteration(projection);
+  attachRecurrenceFacts(projection, sourceOp, loadedValue, Value(), stage);
   std::string key =
       buffer.str() + "|" + getAttr(projection, "index") + "|domain2";
+  appendRecurrenceIds(key, "|path", projection.recurrencePath);
   if (seen.contains(key))
     return;
   seen.insert(key);
   stage.actions.push_back(std::move(projection));
 }
 
-static void
-addGenericAffineStateProjection(AccessStage &stage, llvm::StringSet<> &seen,
-                                StringRef buffer, AffineMap map,
-                                ValueRange operands, GenericRaisingContext &ctx,
-                                StringRef projectionKind = StringRef()) {
+static void addGenericAffineStateProjection(
+    AccessStage &stage, llvm::StringSet<> &seen, StringRef buffer,
+    AffineMap map, ValueRange operands, GenericRaisingContext &ctx,
+    StringRef projectionKind = StringRef(), Operation *sourceOp = nullptr,
+    Value loadedValue = Value()) {
   if (buffer.empty() || map.getNumResults() == 0)
     return;
   AffineExpr expr = map.getResult(0);
@@ -3311,8 +4002,10 @@ addGenericAffineStateProjection(AccessStage &stage, llvm::StringSet<> &seen,
   fillIndexAttrsFromAffineExpr(projection, "index", expr, operands, ctx);
   if (!projectionKind.empty())
     projection.attrs["projection_kind"] = projectionKind.str();
+  attachRecurrenceFacts(projection, sourceOp, loadedValue, Value(), stage);
   std::string key =
       buffer.str() + "|" + getAttr(projection, "index") + "|domain2";
+  appendRecurrenceIds(key, "|path", projection.recurrencePath);
   if (seen.contains(key))
     return;
   seen.insert(key);
@@ -3412,6 +4105,8 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
   llvm::StringSet<> seenProjections;
   llvm::StringMap<unsigned> seenAdvances;
 
+  discoverStructuredRecurrences(root, stage, ctx);
+
   root->walk([&](Operation *op) {
     if (isInsideKnownDeadIf(op, ctx))
       return;
@@ -3445,22 +4140,25 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
       bool projected =
           loadHasOnlyFiniteStateProjection(load.getResult(), projectionKind);
       if (!indexTerms.empty()) {
-        addGenericAccessWithIndexTerms(stage, seenAccesses, "read", buffer,
-                                       indexTerms,
-                                       bytesForMemRef(load.getMemRef()),
-                                       "polygeist memref.load", ctx, projected);
+        addGenericAccessWithIndexTerms(
+            stage, seenAccesses, "read", buffer, indexTerms,
+            bytesForMemRef(load.getMemRef()), "polygeist memref.load", ctx,
+            projected, std::nullopt, load.getOperation(), load.getResult());
         if (projected)
           addGenericStateProjectionWithIndexTerms(
-              stage, seenProjections, buffer, indexTerms, ctx, projectionKind);
+              stage, seenProjections, buffer, indexTerms, ctx, projectionKind,
+              load.getOperation(), load.getResult());
       } else {
         if (load.getIndices().empty())
           return;
         addGenericAccess(stage, seenAccesses, "read", buffer,
                          load.getIndices()[0], bytesForMemRef(load.getMemRef()),
-                         "polygeist memref.load", ctx, projected);
+                         "polygeist memref.load", ctx, projected, std::nullopt,
+                         load.getOperation(), load.getResult());
         if (projected)
           addGenericStateProjection(stage, seenProjections, buffer,
-                                    load.getIndices()[0], ctx, projectionKind);
+                                    load.getIndices()[0], ctx, projectionKind,
+                                    load.getOperation(), load.getResult());
       }
       return;
     }
@@ -3490,7 +4188,8 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
             stage, seenAccesses, "write", buffer, indexTerms,
             bytesForStoredValue(store.getValueToStore(), store.getMemRef()),
             "polygeist memref.store", ctx, false,
-            finiteValueDomain(store.getValueToStore()));
+            finiteValueDomain(store.getValueToStore()), store.getOperation(),
+            store.getValueToStore());
       } else {
         if (store.getIndices().empty())
           return;
@@ -3498,7 +4197,8 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
             stage, seenAccesses, "write", buffer, store.getIndices()[0],
             bytesForStoredValue(store.getValueToStore(), store.getMemRef()),
             "polygeist memref.store", ctx, false,
-            finiteValueDomain(store.getValueToStore()));
+            finiteValueDomain(store.getValueToStore()), store.getOperation(),
+            store.getValueToStore());
       }
       return;
     }
@@ -3524,19 +4224,22 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
         addGenericAccessWithIndexTerms(
             stage, seenAccesses, "read", buffer, indexTerms, accessBytes,
             "polygeist affine.load", ctx, projectionIsExclusive, std::nullopt,
-            load.getOperation());
+            load.getOperation(), load.getResult());
         if (projected)
           addGenericStateProjectionWithIndexTerms(
-              stage, seenProjections, buffer, indexTerms, ctx, projectionKind);
+              stage, seenProjections, buffer, indexTerms, ctx, projectionKind,
+              load.getOperation(), load.getResult());
       } else {
-        addGenericAffineAccess(
-            stage, seenAccesses, "read", buffer, load.getAffineMap(),
-            load.getMapOperands(), accessBytes, "polygeist affine.load", ctx,
-            projectionIsExclusive, std::nullopt, load.getOperation());
+        addGenericAffineAccess(stage, seenAccesses, "read", buffer,
+                               load.getAffineMap(), load.getMapOperands(),
+                               accessBytes, "polygeist affine.load", ctx,
+                               projectionIsExclusive, std::nullopt,
+                               load.getOperation(), load.getResult());
         if (projected)
           addGenericAffineStateProjection(
               stage, seenProjections, buffer, load.getAffineMap(),
-              load.getMapOperands(), ctx, projectionKind);
+              load.getMapOperands(), ctx, projectionKind, load.getOperation(),
+              load.getResult());
       }
       return;
     }
@@ -3558,13 +4261,15 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
         addGenericAccessWithIndexTerms(
             stage, seenAccesses, "write", buffer, indexTerms,
             accessBytesForAffineStore(store), "polygeist affine.store", ctx,
-            false, finiteValueDomain(store.getValueToStore()));
+            false, finiteValueDomain(store.getValueToStore()),
+            store.getOperation(), store.getValueToStore());
       } else {
         addGenericAffineAccess(stage, seenAccesses, "write", buffer,
                                store.getAffineMap(), store.getMapOperands(),
                                accessBytesForAffineStore(store),
                                "polygeist affine.store", ctx, false,
-                               finiteValueDomain(store.getValueToStore()));
+                               finiteValueDomain(store.getValueToStore()),
+                               store.getOperation(), store.getValueToStore());
       }
       return;
     }
@@ -3586,9 +4291,11 @@ static void collectGenericAccesses(Operation *root, AccessStage &stage,
           stage, seenAccesses, "write", buffer, indexTerms,
           bytesForStoredValue(op->getOperand(0), memref),
           "polygeist llvm.store", ctx, false,
-          finiteValueDomain(op->getOperand(0)));
+          finiteValueDomain(op->getOperand(0)), op, op->getOperand(0));
     }
   });
+
+  markLoopBoundaryWrites(root, stage);
 }
 
 static void collectNestedBitGenCallAccesses(
@@ -3747,11 +4454,11 @@ static func::FuncOp chooseGenericDriver(ModuleOp module) {
   return best;
 }
 
-static SmallVector<AccessStage>
+static SmallVector<AccessStage, 8>
 raiseGenericDriver(func::FuncOp driver,
                    llvm::DenseMap<Value, std::string> &buffers,
                    ModuleOp module) {
-  SmallVector<AccessStage> stages;
+  SmallVector<AccessStage, 8> stages;
   if (!driver.getOperation() || driver.empty())
     return stages;
 
@@ -3908,8 +4615,7 @@ materializeRecoveredPipeline(ModuleOp module, Location loc, StringRef name,
         OpBuilder::atBlockEnd(&stageOp->getRegion(0).front());
     IndexScope indices;
     indices.parameters = &parameterValues;
-    materializeActionsDirectly(stageBuilder, loc, bufferValues, indices,
-                               stage.actions);
+    materializeActionsDirectly(stageBuilder, loc, bufferValues, indices, stage);
     stageBuilder.create<YieldOp>(loc);
   }
   assignAccessIds(pipeline);
@@ -3943,10 +4649,11 @@ static bool recoverFromGenericMlir(ModuleOp module) {
     return false;
 
   llvm::DenseMap<Value, std::string> buffers;
-  SmallVector<AccessStage> recovered =
+  SmallVector<AccessStage, 8> recovered =
       raiseGenericDriver(driver, buffers, module);
   if (recovered.empty())
     return false;
+  propagateRecurrenceDomains(recovered);
   pruneStageLocalSyntheticBuffers(recovered);
 
   std::string driverName = driver.getSymName().str();
@@ -3995,10 +4702,11 @@ struct BitstreamRecoverSemanticsPass
         return orderA < orderB;
       });
 
-      SmallVector<AccessStage> recovered;
+      SmallVector<AccessStage, 8> recovered;
       for (const FunctionFacts &stage : stages)
         if (auto result = recoverStage(stage))
           recovered.push_back(*result);
+      propagateRecurrenceDomains(recovered);
       pruneStageLocalSyntheticBuffers(recovered);
 
       SmallVector<std::string> bufferOrder;
@@ -4047,7 +4755,7 @@ struct BitstreamRecoverSemanticsPass
         IndexScope indices;
         indices.parameters = &parameterValues;
         materializeActionsDirectly(stageBuilder, pipeline.getLoc(), buffers,
-                                   indices, stage.actions);
+                                   indices, stage);
         stageBuilder.create<YieldOp>(pipeline.getLoc());
       }
 

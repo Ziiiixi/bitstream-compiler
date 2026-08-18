@@ -26,25 +26,25 @@ module {
       bitstream.write %4[%15] {access_id = "a1", byte_index = #map, bytes = 1 : i64, value_domain = 2 : i64} : !bitstream.buffer
     }
     bitstream.kernel @_Z19gpjson_escape_indexPclPbPl {
-      %10 = bitstream.logical_index : index
-      %11 = gpu.block_id  x
-      %12 = gpu.block_dim  x
-      %13 = arith.muli %11, %12 : index
-      %14 = gpu.thread_id  x
-      %15 = arith.addi %13, %14 : index
+      %10 = gpu.block_id  x
+      %11 = gpu.block_dim  x
+      %12 = arith.muli %10, %11 : index
+      %13 = gpu.thread_id  x
+      %14 = arith.addi %12, %13 : index
       %c-1 = arith.constant -1 : index
-      %16 = arith.addi %15, %c-1 : index
-      bitstream.read %4[%16] {access_id = "a2", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
-      bitstream.read %3[%10] {access_id = "a3", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
-      bitstream.project_state %3[%10] {domain = 2 : i64, modulus = 2 : i64, projection_kind = "ssa_not_ctlz_low_bit", read_access = "a3"} : !bitstream.buffer
+      %15 = arith.addi %14, %c-1 : index
+      bitstream.read %4[%15] {access_id = "a2", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      %16 = bitstream.logical_index : index
+      bitstream.read %3[%16] {access_id = "a3", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      bitstream.project_state %3[%16] {domain = 2 : i64, modulus = 2 : i64, projection_kind = "ssa_not_ctlz_low_bit", read_access = "a3"} : !bitstream.buffer
       %c64 = arith.constant 64 : index
-      %17 = arith.divsi %10, %c64 : index
+      %17 = arith.divsi %16, %c64 : index
       bitstream.write %5[%17] {access_id = "a4", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
       %c-1_0 = arith.constant -1 : index
       %18 = arith.addi %0, %c-1_0 : index
       %c64_1 = arith.constant 64 : index
       %19 = arith.divsi %18, %c64_1 : index
-      bitstream.write %5[%19] {access_id = "a5", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+      bitstream.write %5[%19] {access_id = "a5", byte_index = #map1, bytes = 8 : i64, tail_boundary_write} : !bitstream.buffer
     }
     bitstream.kernel @_Z18gpjson_quote_indexPciPlS0_S_ {
       %10 = bitstream.logical_index : index
@@ -60,7 +60,7 @@ module {
       %13 = arith.addi %0, %c-1 : index
       %c64_1 = arith.constant 64 : index
       %14 = arith.divsi %13, %c64_1 : index
-      bitstream.write %6[%14] {access_id = "a9", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+      bitstream.write %6[%14] {access_id = "a9", byte_index = #map1, bytes = 8 : i64, tail_boundary_write} : !bitstream.buffer
       %15 = gpu.block_id  x
       %16 = gpu.block_dim  x
       %17 = arith.muli %15, %16 : index
@@ -69,13 +69,17 @@ module {
       bitstream.write %7[%19] {access_id = "a10", byte_index = #map, bytes = 1 : i64, value_domain = 2 : i64} : !bitstream.buffer
     }
     bitstream.kernel @_Z19gpjson_xor_pre_scanPci {
-      %10 = bitstream.logical_index : index
-      bitstream.read %7[%10] {access_id = "a11", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
-      bitstream.write %7[%10] {access_id = "a12", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      bitstream.state @state1 transition = xor {bits = 1 : i64, domain = 2 : i64, inferred}
+      bitstream.recurrence operator = "xor" attributes {initial_state = 0 : i64, state_domain = 2 : i64} {
+        %10 = bitstream.logical_index : index
+        bitstream.read %7[%10] dependency = prefix_state state = @state1 state_kind = carried_state {access_id = "a11", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+        bitstream.write %7[%10] {access_id = "a12", byte_index = #map, bytes = 1 : i64, value_domain = 2 : i64} : !bitstream.buffer
+      }
     }
-    bitstream.kernel @_Z20gpjson_xor_post_scanPciiS_ {
+    bitstream.scan @_Z20gpjson_xor_post_scanPciiS_ operator = "xor" attributes {initial_state = 0 : i64, state_domain = 2 : i64} {
+      bitstream.state @state3 transition = xor {bits = 1 : i64, domain = 2 : i64, inferred}
       %10 = bitstream.logical_index : index
-      bitstream.write %8[%10] {access_id = "a13", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      bitstream.write %8[%10] {access_id = "a13", byte_index = #map, bytes = 1 : i64, value_domain = 2 : i64} : !bitstream.buffer
       %11 = arith.addi %1, %2 : index
       %c-1 = arith.constant -1 : index
       %12 = arith.addi %11, %c-1 : index
@@ -88,9 +92,10 @@ module {
       bitstream.read %7[%16] {access_id = "a14", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
       %c-1_1 = arith.constant -1 : index
       %17 = arith.addi %2, %c-1_1 : index
-      bitstream.write %8[%17] {access_id = "a15", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      bitstream.write %8[%17] {access_id = "a15", byte_index = #map, bytes = 1 : i64, tail_boundary_write, value_domain = 2 : i64} : !bitstream.buffer
     }
     bitstream.kernel @_Z17gpjson_xor_rebasePciS_ {
+      bitstream.state @state2 transition = prefix_state_projection {bits = 1 : i64, domain = 2 : i64, inferred}
       %10 = bitstream.logical_index : index
       bitstream.read %7[%10] {access_id = "a16", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
       %11 = gpu.block_id  x
@@ -98,30 +103,33 @@ module {
       %13 = arith.muli %11, %12 : index
       %14 = gpu.thread_id  x
       %15 = arith.addi %13, %14 : index
-      bitstream.read %8[%15] {access_id = "a17", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      bitstream.read %8[%15] dependency = prefix_state state = @state2 state_kind = carried_state {access_id = "a17", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
       bitstream.write %7[%10] {access_id = "a18", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
     }
     bitstream.kernel @_Z19gpjson_string_indexPliPc {
+      bitstream.state @state4 transition = xor {bits = 1 : i64, domain = 2 : i64, inferred}
       bitstream.state @state0 transition = projected_state {bits = 1 : i64, domain = 2 : i64, inferred, modulus = 2 : i64}
-      %10 = bitstream.logical_index : index
-      %11 = gpu.block_id  x
-      %12 = gpu.block_dim  x
-      %13 = arith.muli %11, %12 : index
-      %14 = gpu.thread_id  x
-      %15 = arith.addi %13, %14 : index
+      %10 = gpu.block_id  x
+      %11 = gpu.block_dim  x
+      %12 = arith.muli %10, %11 : index
+      %13 = gpu.thread_id  x
+      %14 = arith.addi %12, %13 : index
       %c-1 = arith.constant -1 : index
-      %16 = arith.addi %15, %c-1 : index
-      bitstream.read %7[%16] dependency = projected_state state = @state0 state_kind = projected_state {access_id = "a19", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
-      %17 = gpu.block_id  x
-      %18 = gpu.block_dim  x
-      %19 = arith.muli %17, %18 : index
-      %20 = gpu.thread_id  x
-      %21 = arith.addi %19, %20 : index
+      %15 = arith.addi %14, %c-1 : index
+      bitstream.read %7[%15] dependency = projected_state state = @state0 state_kind = projected_state {access_id = "a19", byte_index = #map, bytes = 1 : i64} : !bitstream.buffer
+      %16 = gpu.block_id  x
+      %17 = gpu.block_dim  x
+      %18 = arith.muli %16, %17 : index
+      %19 = gpu.thread_id  x
+      %20 = arith.addi %18, %19 : index
       %c-1_0 = arith.constant -1 : index
-      %22 = arith.addi %21, %c-1_0 : index
-      bitstream.project_state %7[%22] {domain = 2 : i64, modulus = 2 : i64, projection_kind = "ssa_not_ctlz_low_bit", read_access = "a19"} : !bitstream.buffer
-      bitstream.read %6[%10] {access_id = "a20", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
-      bitstream.write %6[%10] {access_id = "a21", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+      %21 = arith.addi %20, %c-1_0 : index
+      bitstream.project_state %7[%21] {domain = 2 : i64, modulus = 2 : i64, projection_kind = "ssa_not_ctlz_low_bit", read_access = "a19"} : !bitstream.buffer
+      bitstream.recurrence operator = "xor" attributes {state_domain = 2 : i64} {
+        %22 = bitstream.logical_index : index
+        bitstream.read %6[%22] dependency = prefix_state state = @state4 state_kind = carried_state {access_id = "a20", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+        bitstream.write %6[%22] {access_id = "a21", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+      }
     }
     bitstream.kernel @_Z24gpjson_structural_bitmapPciPlS0_ {
       %10 = bitstream.logical_index : index
@@ -139,7 +147,7 @@ module {
       %14 = arith.addi %0, %c-1 : index
       %c64_2 = arith.constant 64 : index
       %15 = arith.divsi %14, %c64_2 : index
-      bitstream.write %9[%15] {access_id = "a26", byte_index = #map1, bytes = 8 : i64} : !bitstream.buffer
+      bitstream.write %9[%15] {access_id = "a26", byte_index = #map1, bytes = 8 : i64, tail_boundary_write} : !bitstream.buffer
     }
   }
   bitstream.analysis @gpjson_driver_polygeist_raised_analysis for @gpjson_driver_polygeist_raised {
@@ -147,18 +155,18 @@ module {
       bitstream.dependency memory = input consumer_access = "a0" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg0, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_carryPciS_}
       bitstream.dependency memory = raw producer_access = "a1" consumer_access = "a2" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg2, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_indexPclPbPl, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_carryPciS_}
       bitstream.dependency memory = input consumer_access = "a3" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg0, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_indexPclPbPl}
-      bitstream.dependency memory = raw producer_access = "a5" consumer_access = "a6" finite_state = none producer_byte_window = #map3 {buffer = @gpjson_driver_polygeist_raised::@arg3, consumer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_indexPclPbPl}
+      bitstream.dependency memory = raw producer_access = "a4" consumer_access = "a6" finite_state = none producer_byte_window = #map3 {buffer = @gpjson_driver_polygeist_raised::@arg3, consumer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_escape_indexPclPbPl}
       bitstream.dependency memory = input consumer_access = "a7" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg0, consumer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_}
-      bitstream.dependency memory = raw producer_access = "a10" consumer_access = "a11" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg5, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_xor_pre_scanPci, producer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_}
       bitstream.dependency memory = raw producer_access = "a12" consumer_access = "a14" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg5, consumer = @gpjson_driver_polygeist_raised::@_Z20gpjson_xor_post_scanPciiS_, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_xor_pre_scanPci}
       bitstream.dependency memory = raw producer_access = "a12" consumer_access = "a16" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg5, consumer = @gpjson_driver_polygeist_raised::@_Z17gpjson_xor_rebasePciS_, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_xor_pre_scanPci}
-      bitstream.dependency memory = raw producer_access = "a15" consumer_access = "a17" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg6, consumer = @gpjson_driver_polygeist_raised::@_Z17gpjson_xor_rebasePciS_, producer = @gpjson_driver_polygeist_raised::@_Z20gpjson_xor_post_scanPciiS_}
       bitstream.dependency memory = raw producer_access = "a18" consumer_access = "a19" finite_state = proven producer_byte_window = #map2 finite_state_domain = 2 {buffer = @gpjson_driver_polygeist_raised::@arg5, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc, producer = @gpjson_driver_polygeist_raised::@_Z17gpjson_xor_rebasePciS_, states = [@gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc::@state0]}
-      bitstream.dependency memory = raw producer_access = "a9" consumer_access = "a20" finite_state = none producer_byte_window = #map3 {buffer = @gpjson_driver_polygeist_raised::@arg4, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc, producer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_}
       bitstream.dependency memory = raw producer_access = "a21" consumer_access = "a22" finite_state = none producer_byte_window = #map3 {buffer = @gpjson_driver_polygeist_raised::@arg4, consumer = @gpjson_driver_polygeist_raised::@_Z24gpjson_structural_bitmapPciPlS0_, producer = @gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc}
       bitstream.dependency memory = input consumer_access = "a24" finite_state = none producer_byte_window = #map2 {buffer = @gpjson_driver_polygeist_raised::@arg0, consumer = @gpjson_driver_polygeist_raised::@_Z24gpjson_structural_bitmapPciPlS0_}
     }
     bitstream.dependency_group kind = "unbounded" {
+      bitstream.dependency memory = raw producer_access = "a10" consumer_access = "a11" finite_state = proven finite_state_domain = 2 {buffer = @gpjson_driver_polygeist_raised::@arg5, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_xor_pre_scanPci, producer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_, states = [@gpjson_driver_polygeist_raised::@_Z19gpjson_xor_pre_scanPci::@state1]}
+      bitstream.dependency memory = raw producer_access = "a13" consumer_access = "a17" finite_state = proven finite_state_domain = 2 {buffer = @gpjson_driver_polygeist_raised::@arg6, consumer = @gpjson_driver_polygeist_raised::@_Z17gpjson_xor_rebasePciS_, producer = @gpjson_driver_polygeist_raised::@_Z20gpjson_xor_post_scanPciiS_, states = [@gpjson_driver_polygeist_raised::@_Z20gpjson_xor_post_scanPciiS_::@state3, @gpjson_driver_polygeist_raised::@_Z17gpjson_xor_rebasePciS_::@state2]}
+      bitstream.dependency memory = raw producer_access = "a8" consumer_access = "a20" finite_state = proven finite_state_domain = 2 {buffer = @gpjson_driver_polygeist_raised::@arg4, consumer = @gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc, producer = @gpjson_driver_polygeist_raised::@_Z18gpjson_quote_indexPciPlS0_S_, states = [@gpjson_driver_polygeist_raised::@_Z19gpjson_string_indexPliPc::@state4]}
     }
   }
 }

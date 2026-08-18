@@ -111,6 +111,52 @@ struct ExactProjectedRead {
   ProjectStateOp projection;
 };
 
+static ReadOp findExactRead(DependencyOp dep, Operation *consumerStage,
+                            Value buffer) {
+  if (!consumerStage || !buffer)
+    return {};
+  StringRef access = getStringAttr(dep.getOperation(), "consumer_access");
+  if (access.empty())
+    return {};
+
+  ReadOp result;
+  bool ambiguous = false;
+  consumerStage->walk([&](ReadOp read) {
+    if (read.getBuffer() != buffer ||
+        getStringAttr(read.getOperation(), "access_id") != access)
+      return;
+    if (result) {
+      ambiguous = true;
+      return;
+    }
+    result = read;
+  });
+  return ambiguous ? ReadOp() : result;
+}
+
+static WriteOp findExactWrite(DependencyOp dep, Operation *producerStage,
+                              Value buffer) {
+  if (!producerStage || !buffer)
+    return {};
+  StringRef access = getStringAttr(dep.getOperation(), "producer_access");
+  if (access.empty())
+    return {};
+
+  WriteOp result;
+  bool ambiguous = false;
+  producerStage->walk([&](WriteOp write) {
+    if (write.getBuffer() != buffer ||
+        getStringAttr(write.getOperation(), "access_id") != access)
+      return;
+    if (result) {
+      ambiguous = true;
+      return;
+    }
+    result = write;
+  });
+  return ambiguous ? WriteOp() : result;
+}
+
 static std::optional<ExactProjectedRead>
 findExactProjectedRead(DependencyOp dep, Operation *consumerStage,
                        Value buffer) {
@@ -381,36 +427,85 @@ struct BitstreamSpeculativeFusionPass
         }
 
         bool producerIsScan = isa<ScanOp>(producerStage);
+        ReadOp exactRead = findExactRead(dep, consumerStage, pipelineBuffer);
+        WriteOp exactWrite = findExactWrite(dep, producerStage, pipelineBuffer);
         std::optional<ExactProjectedRead> projected =
             findExactProjectedRead(dep, consumerStage, pipelineBuffer);
-        if (!projected ||
-            (!producerIsScan &&
-             !isNestedUnderWhile(projected->read, consumerStage))) {
+
+        RecurrenceOp recurrence =
+            exactRead ? findVaryingRecurrence(exactRead) : RecurrenceOp();
+        std::optional<int64_t> scanDomain =
+            producerIsScan ? getI64Attr(producerStage, "state_domain")
+                           : std::nullopt;
+        std::optional<int64_t> writeDomain =
+            exactWrite ? getI64Attr(exactWrite.getOperation(), "value_domain")
+                       : std::nullopt;
+        std::optional<int64_t> recurrenceDomain =
+            recurrence ? getI64Attr(recurrence.getOperation(), "state_domain")
+                       : std::nullopt;
+
+        bool hasFiniteScanOutput = producerIsScan && exactRead && exactWrite &&
+                                   scanDomain && *scanDomain > 0 &&
+                                   writeDomain && *scanDomain == *writeDomain;
+        bool hasFiniteRecurrenceRead = !producerIsScan && exactRead &&
+                                       recurrence && recurrenceDomain &&
+                                       *recurrenceDomain > 0;
+        bool hasExactProjection =
+            projected && (producerIsScan ||
+                          isNestedUnderWhile(projected->read, consumerStage));
+
+        if (!exactRead || (!hasFiniteScanOutput && !hasFiniteRecurrenceRead &&
+                           !hasExactProjection)) {
           illegalReasons.push_back(concat(
               producerIsScan
-                  ? StringRef("scan dependency has no exact "
-                              "access-linked ProjectState proof for buffer ")
-                  : StringRef("predecessor dependency has no exact "
-                              "while-read ProjectState proof for buffer "),
+                  ? StringRef("scan dependency has neither exact finite scan "
+                              "output evidence nor an access-linked "
+                              "ProjectState proof for buffer ")
+                  : (recurrence
+                         ? StringRef("recurrence dependency has no finite "
+                                     "recovered state domain for buffer ")
+                         : StringRef("predecessor dependency has no exact "
+                                     "while-read ProjectState proof for "
+                                     "buffer ")),
               buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
           return;
         }
 
         auto readDependency =
-            projected->read.getOperation()
-                ->getAttrOfType<ReadDependencyKindAttr>("dependency");
+            exactRead.getOperation()->getAttrOfType<ReadDependencyKindAttr>(
+                "dependency");
         ReadDependencyKind expectedDependency =
-            producerIsScan ? ReadDependencyKind::PrefixState
-                           : ReadDependencyKind::DataDependentPredecessor;
+            (producerIsScan || hasFiniteRecurrenceRead)
+                ? ReadDependencyKind::PrefixState
+                : ReadDependencyKind::DataDependentPredecessor;
         if (!readDependency ||
             readDependency.getValue() != expectedDependency) {
           illegalReasons.push_back(concat(
-              producerIsScan
-                  ? StringRef("scan read lacks its inferred prefix-state proof "
-                              "for buffer ")
+              (producerIsScan || hasFiniteRecurrenceRead)
+                  ? StringRef("scan/recurrence read lacks its inferred "
+                              "prefix-state proof for buffer ")
                   : StringRef(
                         "predecessor read lacks its inferred finite-state "
                         "proof for buffer "),
+              buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
+          return;
+        }
+
+        auto stateUse =
+            exactRead.getOperation()->getAttrOfType<StateUseKindAttr>(
+                "state_kind");
+        StateUseKind expectedStateUse =
+            (hasFiniteScanOutput || hasFiniteRecurrenceRead)
+                ? StateUseKind::CarriedState
+                : (producerIsScan ? StateUseKind::FiniteStateProjection
+                                  : StateUseKind::NeighborFiniteState);
+        if (!stateUse || stateUse.getValue() != expectedStateUse) {
+          illegalReasons.push_back(concat(
+              (hasFiniteScanOutput || hasFiniteRecurrenceRead)
+                  ? StringRef("structural scan/recurrence read is not marked "
+                              "as carried state for buffer ")
+                  : StringRef("projected finite-state read has inconsistent "
+                              "state use for buffer "),
               buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
           return;
         }
@@ -439,15 +534,32 @@ struct BitstreamSpeculativeFusionPass
                 buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
             return;
           }
-          auto projectedDomain =
-              projected->projection.getOperation()->getAttrOfType<IntegerAttr>(
-                  "domain");
-          if (!projectedDomain || projectedDomain.getInt() != *provenDomain) {
-            illegalReasons.push_back(concat(
-                "dependency state domain does not match its exact "
-                "ProjectState proof for buffer ",
-                buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
-            return;
+          if (hasFiniteScanOutput) {
+            if (*scanDomain != *provenDomain || *writeDomain != *provenDomain) {
+              illegalReasons.push_back(concat(
+                  "scan state and exact producer value domains do not match "
+                  "the dependency proof for buffer ",
+                  buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
+              return;
+            }
+          } else if (hasFiniteRecurrenceRead) {
+            if (*recurrenceDomain != *provenDomain) {
+              illegalReasons.push_back(concat(
+                  "recurrence state domain does not match the dependency "
+                  "proof for buffer ",
+                  buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
+              return;
+            }
+          } else {
+            auto projectedDomain = projected->projection.getOperation()
+                                       ->getAttrOfType<IntegerAttr>("domain");
+            if (!projectedDomain || projectedDomain.getInt() != *provenDomain) {
+              illegalReasons.push_back(concat(
+                  "dependency state domain does not match its exact "
+                  "ProjectState proof for buffer ",
+                  buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
+              return;
+            }
           }
           if (*provenDomain < kMinimumRuntimeStateDomain ||
               (producerIsScan && *provenDomain != kBinaryScanStateDomain) ||
@@ -456,7 +568,7 @@ struct BitstreamSpeculativeFusionPass
                 producerIsScan
                     ? StringRef("scan dependency is not proven binary for "
                                 "buffer ")
-                    : StringRef("projected-state dependency exceeds template "
+                    : StringRef("finite-state dependency exceeds template "
                                 "domain for buffer "),
                 buffer ? leafSymbolName(buffer) : StringRef("<unknown>")));
             return;
@@ -492,7 +604,7 @@ struct BitstreamSpeculativeFusionPass
                          domainIt->second > kMaxProjectedStateDomain) {
                 illegalReasons.push_back(
                     concat("state ", stateName,
-                           " exceeds projected-state template domain"));
+                           " exceeds finite-state template domain"));
               }
             }
           }

@@ -5,6 +5,8 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 
 #include "Bitstream/BitstreamOpsEnums.cpp.inc"
 
@@ -61,6 +63,33 @@ static LogicalResult verifySymbolRefArray(Operation *from, ArrayAttr refs,
       return failure();
   }
   return success();
+}
+
+static LogicalResult verifyFiniteStateMetadata(Operation *op) {
+  auto domain = op->getAttrOfType<IntegerAttr>("state_domain");
+  if (domain && domain.getInt() <= 0)
+    return op->emitOpError() << "`state_domain` must be positive when present";
+
+  auto initial = op->getAttrOfType<IntegerAttr>("initial_state");
+  if (!initial)
+    return success();
+  if (initial.getInt() < 0)
+    return op->emitOpError()
+           << "`initial_state` must be non-negative when present";
+  if (!domain)
+    return op->emitOpError() << "with `initial_state` requires `state_domain`";
+  if (initial.getInt() >= domain.getInt())
+    return op->emitOpError()
+           << "`initial_state` must be less than `state_domain`";
+  return success();
+}
+
+LogicalResult RecurrenceOp::verify() {
+  return verifyFiniteStateMetadata(getOperation());
+}
+
+LogicalResult ScanOp::verify() {
+  return verifyFiniteStateMetadata(getOperation());
 }
 
 LogicalResult StateOp::verify() {
@@ -294,6 +323,49 @@ static FailureOr<AffineMap> expectedProducerByteWindow(ReadOp read) {
   return AffineMap::get(/*dimCount=*/1, /*symbolCount=*/0, interval, context);
 }
 
+static bool indexVariesInRecurrence(Value index, RecurrenceOp recurrence) {
+  SmallVector<Value, 8> worklist;
+  llvm::SmallPtrSet<Value, 16> seen;
+  if (index)
+    worklist.push_back(index);
+
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!value || !seen.insert(value).second)
+      continue;
+
+    if (isa<BlockArgument>(value))
+      continue;
+
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp)
+      continue;
+    if (isa<LogicalIndexOp>(definingOp)) {
+      auto owner = definingOp->getParentOfType<RecurrenceOp>();
+      if (owner && owner.getOperation() == recurrence.getOperation())
+        return true;
+    }
+    worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+  }
+  return false;
+}
+
+// A read may be nested inside a second recurrence while its address is driven
+// by an outer recurrence coordinate.  Return the exact enclosing recurrence
+// whose coordinate reaches the read instead of looking only at the nearest
+// marker.
+RecurrenceOp bitstream::findVaryingRecurrence(ReadOp read) {
+  for (Operation *parent = read.getOperation()->getParentOp(); parent;
+       parent = parent->getParentOp()) {
+    auto recurrence = dyn_cast<RecurrenceOp>(parent);
+    if (recurrence && indexVariesInRecurrence(read.getIndex(), recurrence))
+      return recurrence;
+    if (isa<KernelOp, ScanOp>(parent))
+      break;
+  }
+  return {};
+}
+
 LogicalResult DependencyOp::verify() {
   for (StringRef removed : {"kind", "index_relation", "span",
                             "finite_state_proof", "external_input"})
@@ -350,11 +422,12 @@ LogicalResult DependencyOp::verify() {
                                     "consumer_access", &consumerAccessOp)))
     return failure();
   Operation *producerStage = nullptr;
+  Operation *producerAccessOp = nullptr;
   if (memory.getValue() == MemoryDependencyKind::RAW) {
     producerStage = lookupSymbolRef(getOperation(), producer);
-    if (failed(verifyReferencedAccess(getOperation(), producerStage, bufferOp,
-                                      producerAccess,
-                                      /*expectRead=*/false, "producer_access")))
+    if (failed(verifyReferencedAccess(
+            getOperation(), producerStage, bufferOp, producerAccess,
+            /*expectRead=*/false, "producer_access", &producerAccessOp)))
       return failure();
   }
 
@@ -365,6 +438,7 @@ LogicalResult DependencyOp::verify() {
            << "cannot resolve `consumer_access` to a bitstream.read";
   bool isStructurallyUnbounded =
       static_cast<bool>(read.getOperation()->getParentOfType<scf::WhileOp>()) ||
+      static_cast<bool>(findVaryingRecurrence(read)) ||
       isa_and_nonnull<ScanOp>(producerStage);
   if (isStructurallyUnbounded) {
     if (window)
@@ -435,13 +509,43 @@ LogicalResult DependencyOp::verify() {
           projectionDomain.getInt() == finiteStateDomain.getInt())
         matchingProjections.push_back(projection);
     });
-    if (matchingProjections.size() != 1)
+
+    bool hasFiniteScanOutput = false;
+    if (auto scan = dyn_cast_or_null<ScanOp>(producerStage)) {
+      auto scanDomain =
+          scan.getOperation()->getAttrOfType<IntegerAttr>("state_domain");
+      auto producerWrite = dyn_cast_or_null<WriteOp>(producerAccessOp);
+      auto valueDomain =
+          producerWrite
+              ? producerWrite.getOperation()->getAttrOfType<IntegerAttr>(
+                    "value_domain")
+              : IntegerAttr();
+      hasFiniteScanOutput = scanDomain && valueDomain && finiteStateDomain &&
+                            scanDomain.getInt() == finiteStateDomain.getInt() &&
+                            valueDomain.getInt() == finiteStateDomain.getInt();
+    }
+
+    bool hasFiniteRecurrenceRead = false;
+    if (auto recurrence = findVaryingRecurrence(read)) {
+      auto recurrenceDomain =
+          recurrence.getOperation()->getAttrOfType<IntegerAttr>("state_domain");
+      hasFiniteRecurrenceRead =
+          recurrenceDomain && finiteStateDomain &&
+          recurrenceDomain.getInt() == finiteStateDomain.getInt();
+    }
+
+    if (matchingProjections.size() != 1 && !hasFiniteScanOutput &&
+        !hasFiniteRecurrenceRead)
       return emitOpError()
-             << "with `finite_state = proven` requires exactly one "
+             << "with `finite_state = proven` requires either exactly one "
                 "consumer-stage `bitstream.project_state` matching "
                 "`consumer_access`, buffer, SSA index, and "
-                "`finite_state_domain`; found "
-             << matchingProjections.size();
+                "`finite_state_domain`, or a producer `bitstream.scan` whose "
+                "`state_domain` and exact producer write `value_domain` both "
+                "match `finite_state_domain`, or an exact recurrence-varying "
+                "consumer read whose enclosing `bitstream.recurrence` has a "
+                "matching `state_domain`; found "
+             << matchingProjections.size() << " matching projections";
 
     for (Attribute attr : states) {
       auto ref = cast<SymbolRefAttr>(attr);

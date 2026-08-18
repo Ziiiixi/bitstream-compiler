@@ -5,6 +5,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -128,6 +129,52 @@ struct ProjectionRef {
   Value index;
 };
 
+static ReadOp findExactReadForEdge(DependencyOp dep, Operation *consumerStage,
+                                   Value buffer) {
+  if (!consumerStage || !buffer)
+    return {};
+  StringRef access = getStringAttr(dep.getOperation(), "consumer_access");
+  if (access.empty())
+    return {};
+
+  ReadOp result;
+  bool ambiguous = false;
+  consumerStage->walk([&](ReadOp read) {
+    if (read.getBuffer() != buffer ||
+        getStringAttr(read.getOperation(), "access_id") != access)
+      return;
+    if (result) {
+      ambiguous = true;
+      return;
+    }
+    result = read;
+  });
+  return ambiguous ? ReadOp() : result;
+}
+
+static WriteOp findExactWriteForEdge(DependencyOp dep, Operation *producerStage,
+                                     Value buffer) {
+  if (!producerStage || !buffer)
+    return {};
+  StringRef access = getStringAttr(dep.getOperation(), "producer_access");
+  if (access.empty())
+    return {};
+
+  WriteOp result;
+  bool ambiguous = false;
+  producerStage->walk([&](WriteOp write) {
+    if (write.getBuffer() != buffer ||
+        getStringAttr(write.getOperation(), "access_id") != access)
+      return;
+    if (result) {
+      ambiguous = true;
+      return;
+    }
+    result = write;
+  });
+  return ambiguous ? WriteOp() : result;
+}
+
 static std::optional<ProjectionRef> getProjectionRef(Operation *op) {
   if (auto projection = dyn_cast<ProjectStateOp>(op))
     return ProjectionRef{op, projection.getBuffer(), projection.getIndex()};
@@ -234,6 +281,16 @@ static void annotateReadWithState(ReadOp read, StringRef stateName,
                                StateUseKindAttr::get(ctx, stateKind));
 }
 
+static std::optional<int64_t> positiveDomain(Operation *op,
+                                             StringRef attribute) {
+  if (!op)
+    return std::nullopt;
+  auto domain = op->getAttrOfType<IntegerAttr>(attribute);
+  if (!domain || domain.getInt() <= 0)
+    return std::nullopt;
+  return domain.getInt();
+}
+
 static void clearEdgeFiniteStateProof(DependencyOp dep, Builder &builder) {
   dep.getOperation()->setAttr(
       "finite_state", FiniteStateProofKindAttr::get(
@@ -286,6 +343,7 @@ struct BitstreamFiniteStateInferencePass
       llvm::StringMap<Value> buffersByName;
       llvm::StringMap<Operation *> stagesByName;
       llvm::StringMap<std::string> scanStateByStageAndBuffer;
+      llvm::DenseMap<Operation *, std::string> recurrenceStateByOp;
       unsigned nextStateId = 0;
       auto newStateName = [&]() {
         return "state" + std::to_string(nextStateId++);
@@ -419,6 +477,29 @@ struct BitstreamFiniteStateInferencePass
         return stateName;
       };
 
+      auto getOrCreateRecurrenceState =
+          [&](RecurrenceOp recurrence, Operation *stage,
+              int64_t domain) -> std::optional<std::string> {
+        if (!recurrence || !stage || domain <= 0)
+          return std::nullopt;
+        auto existing = recurrenceStateByOp.find(recurrence.getOperation());
+        if (existing != recurrenceStateByOp.end())
+          return existing->second;
+
+        StringRef combiner =
+            getStringAttr(recurrence.getOperation(), "combiner");
+        std::optional<int64_t> modulus;
+        StateTransitionKind transition = StateTransitionKind::AddMod;
+        if (combiner == "xor")
+          transition = StateTransitionKind::Xor;
+        else
+          modulus = domain;
+        std::string stateName = createStateForStage(stage, domain, transition,
+                                                    std::nullopt, modulus);
+        recurrenceStateByOp[recurrence.getOperation()] = stateName;
+        return stateName;
+      };
+
       analysis.getBody().walk([&](DependencyOp dep) {
         if (!hasRawMemoryDependency(dep))
           return;
@@ -454,6 +535,46 @@ struct BitstreamFiniteStateInferencePass
         bool consumerIsScan = isa<ScanOp>(consumerStage);
 
         if (producerIsScan && !consumerIsScan && !hasFiniteByteWindow) {
+          ReadOp exactRead = findExactReadForEdge(dep, consumerStage, buffer);
+          WriteOp exactWrite =
+              findExactWriteForEdge(dep, producerStage, buffer);
+          std::optional<int64_t> scanDomain =
+              positiveDomain(producerStage, "state_domain");
+          std::optional<int64_t> valueDomain =
+              exactWrite
+                  ? positiveDomain(exactWrite.getOperation(), "value_domain")
+                  : std::nullopt;
+
+          // Preferred structural proof: recovery identified a global scan,
+          // its carried state has a finite domain, and the exact write named
+          // by this dependency stores a value in that same domain.  The exact
+          // consumer access therefore reads the scan state directly; no
+          // source-name heuristic or fabricated ProjectState is needed.
+          if (exactRead && exactWrite && scanDomain && valueDomain &&
+              *scanDomain == *valueDomain) {
+            StringRef scanName = leafSymbolName(producerRef);
+            std::string consumerState =
+                createStateForStage(consumerStage, *scanDomain,
+                                    StateTransitionKind::PrefixStateProjection,
+                                    std::nullopt, std::nullopt);
+            std::optional<std::string> scanState = getOrCreateScanState(
+                producerStage, scanName, bufferName, *scanDomain);
+            if (!scanState)
+              return;
+
+            annotateReadWithState(exactRead, consumerState,
+                                  ReadDependencyKind::PrefixState,
+                                  StateUseKind::CarriedState);
+            setEdgeFiniteStateProof(
+                dep, builder,
+                makeTwoStateRefArray(builder, pipelineName, scanName,
+                                     *scanState, consumerName, consumerState),
+                *scanDomain);
+            return;
+          }
+
+          // Compatibility path for hand-written/older IR that lacks recovered
+          // scan-domain metadata but provides an exact ProjectState proof.
           std::optional<ProjectedRead> projected =
               findProjectedReadForEdge(dep, consumerStage, buffer);
           if (!projected)
@@ -462,6 +583,9 @@ struct BitstreamFiniteStateInferencePass
           int64_t domain =
               projected->projection->getAttrOfType<IntegerAttr>("domain")
                   .getInt();
+          if ((scanDomain && *scanDomain != domain) ||
+              (valueDomain && *valueDomain != domain))
+            return;
           std::string consumerState = createStateForStage(
               consumerStage, domain, StateTransitionKind::PrefixStateProjection,
               std::nullopt, std::nullopt);
@@ -516,6 +640,26 @@ struct BitstreamFiniteStateInferencePass
 
         if (consumerIsScan || producerIsScan)
           return;
+
+        ReadOp exactRead = findExactReadForEdge(dep, consumerStage, buffer);
+        RecurrenceOp recurrence =
+            exactRead ? findVaryingRecurrence(exactRead) : RecurrenceOp();
+        std::optional<int64_t> recurrenceDomain =
+            recurrence
+                ? positiveDomain(recurrence.getOperation(), "state_domain")
+                : std::nullopt;
+        if (exactRead && recurrence && recurrenceDomain) {
+          std::optional<std::string> stateName = getOrCreateRecurrenceState(
+              recurrence, consumerStage, *recurrenceDomain);
+          if (!stateName)
+            return;
+          annotateReadWithState(exactRead, *stateName,
+                                ReadDependencyKind::PrefixState,
+                                StateUseKind::CarriedState);
+          markEdgeFiniteState(dep, builder, pipelineName, consumerName,
+                              *stateName, *recurrenceDomain);
+          return;
+        }
 
         std::optional<ProjectedRead> projected =
             findProjectedReadForEdge(dep, consumerStage, buffer);

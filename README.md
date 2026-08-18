@@ -41,7 +41,7 @@ prepared CUDA/C++ workload
 01  Generic MLIR
         │ bitstream-recover-access-graph
         ▼
-02  Conservative bitstream access-set IR
+02  Conservative bitstream access-set and recurrence IR
         │ bitstream-dependence-analysis
         ▼
 03  RAW dependencies and finite byte-window witnesses
@@ -262,6 +262,100 @@ This descriptor is the current compiler endpoint; it does not yet contain the
 generated fused CUDA body. See
 [`06_fusion_legality.mlir`](analysis/cujson/06_fusion_legality.mlir).
 
+## Recovered loop-carried state in gpJSON
+
+`RecoverSemantics.cpp` now preserves structurally recognized loop-carried value
+flow instead of reducing those source loops to a flat list of reads and
+writes. It follows `scf.for` iteration arguments or `scf.while` carried lanes
+and their yielded updates. The current finite-state recognizer handles XOR and
+the projected high-bit XOR form used by gpJSON; an unrecognized update receives
+no finite-state claim. It does not recognize these recurrences because a
+function happens to contain `scan` in its name.
+
+The recovered operation depends on the scope of the carried state:
+
+- `bitstream.kernel` containing `bitstream.recurrence` means that one GPU work
+  item performs a sequential local recurrence over its own chunk.
+- `bitstream.scan` means that the stage itself computes a global prefix over
+  logical work items.
+- An ordinary `bitstream.kernel` has no recovered loop-carried state relevant
+  to dependency legality.
+
+The distinction is visible in the gpJSON carry path:
+
+```mermaid
+flowchart LR
+    accTitle: gpJSON recovered carry pipeline
+    accDescr: gpJSON quote carry moves through a thread-local recurrence, a global prefix scan, an elementwise rebase kernel, and a second local recurrence for in-string state
+
+    quote_index["Quote index kernel"] -->|binary carry| xor_pre["Kernel plus local recurrence"]
+    xor_pre -->|local partials| xor_post["Global scan"]
+    xor_post -->|chunk bases| xor_rebase["Ordinary rebase kernel"]
+    xor_rebase -->|corrected carry| string_index["Kernel plus local recurrence"]
+    quote_index -->|quote words| string_index
+```
+
+The raised IR uses explicit finite-state metadata:
+
+```mlir
+bitstream.kernel @gpjson_xor_pre_scan {
+  bitstream.recurrence operator = "xor"
+      attributes {initial_state = 0 : i64, state_domain = 2 : i64} {
+    %iteration = bitstream.logical_index : index
+    bitstream.read %quote_carry[%iteration] {...} : !bitstream.buffer
+    bitstream.write %quote_carry[%iteration]
+      {value_domain = 2 : i64, ...} : !bitstream.buffer
+  }
+}
+
+bitstream.scan @gpjson_xor_post_scan operator = "xor"
+    attributes {initial_state = 0 : i64, state_domain = 2 : i64} {
+  ...
+}
+```
+
+| Source stage | Recovered form | Structural reason |
+|---|---|---|
+| `gpjson_xor_pre_scan` | `kernel` + local `recurrence` | Each GPU thread XOR-scans its own disjoint chunk; only the carried parity crosses local iterations. |
+| `gpjson_xor_post_scan` | global `scan` | One scheduler-independent loop prefix-scans the chunk summaries and publishes a base for every chunk. |
+| `gpjson_xor_rebase` | ordinary `kernel` | Each work item independently XORs its partial values with one already-computed base. |
+| `gpjson_string_index` | `kernel` + local `recurrence` | Each thread walks its quote words sequentially; the high bit passed to the next local iteration has domain `{0, 1}`. |
+
+An access inside `bitstream.recurrence` is not automatically unbounded. A read
+whose index is captured from outside the recurrence retains its finite byte
+window. A read whose SSA index reaches the recurrence-local
+`bitstream.logical_index` has no fixed producer window for the enclosing work
+item. Such a RAW edge is legal only when the recovered recurrence has a
+positive finite `state_domain`; finite-state inference marks the exact read
+with `state_kind = carried_state`.
+
+A value produced by global `bitstream.scan` also has no finite producer window.
+For the gpJSON scan-to-rebase edge, the proof is structural and exact:
+`ScanOp.state_domain = 2`, the write named by `producer_access` has
+`value_domain = 2`, and `consumer_access` resolves to the corresponding rebase
+read. This path does not fabricate a `bitstream.project_state`.
+
+The current gpJSON trace therefore has three required domain-2 proofs:
+
+| Edge | Why no finite producer window | Proof source |
+|---|---|---|
+| `a10 → a11` | `xor_pre_scan` reads a recurrence-varying carry index. | Local XOR recurrence with `state_domain = 2`. |
+| `a13 → a17` | `xor_rebase` consumes output from a global scan. | Scan domain and exact producer write `value_domain` both equal `2`. |
+| `a8 → a20` | `string_index` reads a recurrence-varying quote-word index. | Local in-string recurrence with `state_domain = 2`. |
+
+The conditional final-word flush in `quote_index` is access `a9`. Recovery
+marks it as `tail_boundary_write`, so dependency discovery keeps the steady
+loop write `a8` as the representative producer while still retaining `a9` in
+the access IR.
+
+The exact raised operations, dependencies, classification, proofs, and final
+legality result are committed as
+[`02_bitstream_raised.mlir`](analysis/gpjson/02_bitstream_raised.mlir),
+[`03_raw_dependencies.mlir`](analysis/gpjson/03_raw_dependencies.mlir),
+[`04_classified_dependencies.mlir`](analysis/gpjson/04_classified_dependencies.mlir),
+[`05_finite_state_proof.mlir`](analysis/gpjson/05_finite_state_proof.mlir), and
+[`06_fusion_legality.mlir`](analysis/gpjson/06_fusion_legality.mlir).
+
 ## Repository structure
 
 ```text
@@ -334,25 +428,36 @@ to the IDs of the real producer write and consumer read. There is no separate
 
 `producer_byte_window` is a two-result affine map describing the finite
 half-open producer interval needed by a consumer. Its presence is the bounded
-witness. Dependencies with a scan producer or loop-carried predecessor read
-have no such map and appear in the unbounded group.
+witness. Dependencies with a scan producer, a recurrence-varying read, or a
+loop-carried predecessor read have no such map and appear in the unbounded
+group.
 
 Every dependency also has an independent finite-state status:
 
 - `finite_state = none`
 - `finite_state = proven finite_state_domain = N`
 
-`proven` requires a concrete `bitstream.project_state` linked to the same
-consumer `access_id`, buffer, SSA address, and finite domain. A projection on
-one read cannot legalize another read of the same buffer.
+`proven` always requires exact access IDs and one of three structural witnesses:
+
+- a concrete `bitstream.project_state` linked to the same consumer
+  `access_id`, buffer, SSA address, and finite domain;
+- a recurrence-varying read enclosed by `bitstream.recurrence` with a positive
+  `state_domain`; or
+- a `bitstream.scan` producer whose `state_domain` matches the exact producer
+  write's `value_domain`.
+
+The latter two paths annotate the exact read with
+`state_kind = carried_state`. A witness attached to one read cannot legalize a
+different read of the same buffer.
 
 More detailed operation contracts are documented in
 `mlir/bitstream/README.md`.
 
 ## Assumptions and safety boundary
 
-- Kernel stages are modeled as parallel loops over an explicit logical
-  coordinate recovered from source SSA provenance.
+- Kernel stages are modeled as parallel work items over an explicit logical
+  coordinate recovered from source SSA provenance. A nested
+  `bitstream.recurrence` preserves sequential work local to one item.
 - Regular addresses must be expressible with the supported affine arithmetic.
   The compiler never treats a variable as logical merely because it is named
   `i`, `j`, `k`, or `index`.
@@ -361,7 +466,12 @@ More detailed operation contracts are documented in
 - A finite byte-window witness establishes ordinary local fusion legality.
   An edge without a finite window requires an exact finite-state proof.
 - The current compiler does not prove arbitrary transducer associativity. It
-  preserves and verifies the concrete projected state used for validation.
+  preserves explicit loop-carried state, verifies its finite domain, and still
+  requires exact access-linked evidence for dependency legality.
+- Finite-state metadata is intended to be produced by the recovery and
+  inference passes. Full write-coverage proof for partially updated buffers is
+  not yet represented, so hand-authored or stale domain attributes are outside
+  the trusted pipeline.
 - The endpoint is a legality descriptor, not final CUDA code generation.
 
 ## Workloads and current trace results
@@ -369,7 +479,7 @@ More detailed operation contracts are documented in
 | Workload | Dependency edges | Edges without a finite byte window | Required dependency proofs | Final result |
 |---|---:|---:|---:|---|
 | cuJSON tokenizer | 14 | 2 | 2 | legal speculative-fusion descriptor |
-| gpJSON | 13 | 0 | 0 | legal finite-window descriptor |
+| gpJSON | 13 | 3 | 3 | legal decoupled-lookback descriptor |
 | BitGen regex example | 27 | 0 | 0 | legal regex-state descriptor |
 
 These counts describe the committed prepared inputs and should be regenerated

@@ -66,13 +66,16 @@ def Bitstream_StateUseProjection
                       "finite_state_projection">;
 def Bitstream_StateUseProjected
     : I32EnumAttrCase<"ProjectedState", 2, "projected_state">;
+def Bitstream_StateUseCarried
+    : I32EnumAttrCase<"CarriedState", 3, "carried_state">;
 
 def Bitstream_StateUseKind : I32EnumAttr<
     "StateUseKind",
     "how a read consumes a finite state",
     [Bitstream_StateUseNeighbor,
      Bitstream_StateUseProjection,
-     Bitstream_StateUseProjected]> {
+     Bitstream_StateUseProjected,
+     Bitstream_StateUseCarried]> {
   let cppNamespace = "::bitstream";
 }
 
@@ -343,6 +346,30 @@ def Bitstream_SourceArrayAccessOp : Bitstream_Op<"source_array_access",
   let assemblyFormat = "attr-dict";
 }
 
+def Bitstream_RecurrenceOp : Bitstream_Op<"recurrence", [
+    SingleBlockImplicitTerminator<"YieldOp">
+  ]> {
+  let summary = "loop-carried state recurrence nested in a bitstream stage";
+  let description = [{
+    Preserves a loop-carried state update whose transitive dependence cannot be
+    represented by the byte windows of its nested reads and writes alone.
+    `combiner` names the recovered state update.  When present, `state_domain`
+    gives the finite cardinality of the carried state and `initial_state` gives
+    its entry value.
+
+    This op deliberately does not claim `NoMemoryEffect`: its body may contain
+    bitstream reads and writes.
+  }];
+  let arguments = (ins
+    StrAttr:$combiner,
+    OptionalAttr<I64Attr>:$state_domain,
+    OptionalAttr<I64Attr>:$initial_state
+  );
+  let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
+  let assemblyFormat = "`operator` `=` $combiner attr-dict-with-keyword $body";
+}
+
 def Bitstream_ScanOp : Bitstream_Op<"scan", [
     AffineScope,
     Symbol,
@@ -350,8 +377,14 @@ def Bitstream_ScanOp : Bitstream_Op<"scan", [
     SingleBlockImplicitTerminator<"YieldOp">
   ]> {
   let summary = "logical prefix-scan stage";
-  let arguments = (ins SymbolNameAttr:$sym_name, StrAttr:$combiner);
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    StrAttr:$combiner,
+    OptionalAttr<I64Attr>:$state_domain,
+    OptionalAttr<I64Attr>:$initial_state
+  );
   let regions = (region SizedRegion<1>:$body);
+  let hasVerifier = 1;
   let assemblyFormat = "$sym_name `operator` `=` $combiner attr-dict-with-keyword $body";
 }
 
@@ -363,10 +396,12 @@ def Bitstream_BufferOp : Bitstream_Op<"buffer", [Pure, Symbol]> {
 }
 
 def Bitstream_LogicalIndexOp : Bitstream_Op<"logical_index", [Pure]> {
-  let summary = "logical item coordinate of the enclosing bitstream stage";
+  let summary = "logical item coordinate of the enclosing access scope";
   let description = [{
-    Represents the canonical per-stage logical coordinate used to compare
-    accesses across kernels and scans.  It deliberately has neither a source
+    Represents the canonical coordinate of the closest enclosing stage or
+    local recurrence.  Stage coordinates compare accesses across kernels and
+    scans; a coordinate defined inside bitstream.recurrence enumerates that
+    recurrence's local access set.  It deliberately has neither a source
     variable name nor an extent: those are not properties of a memory access.
   }];
   let results = (outs Index:$result);
