@@ -60,26 +60,10 @@ The numbered files are deliberately committed under `analysis/`. A reader can
 inspect the compiler transformation step by step without first building LLVM,
 MLIR, or Polygeist.
 
-## A complete cuJSON example
+## A concret cuJSON example
 
-This walkthrough follows one dependency from the original escaped-quote C++
-loop through every compiler artifact. The relevant edge is the bitmap
-producer's write `a7` to the predecessor read `a11`. To keep the walkthrough
-readable, snippets omit unrelated operands and give descriptive names to some
-SSA values; the links below open the exact generated files.
-
-```mermaid
-flowchart LR
-    accTitle: cuJSON dependency transformation
-    accDescr: The escaped-quote predecessor dependency is followed from source C++ through generic MLIR, recovered access IR, dependency discovery, classification, finite-state proof, and fusion legality
-
-    source_cpp(["C++ backward walk"]) --> generic_mlir["01 Generic MLIR"]
-    generic_mlir --> access_ir["02 Access-set IR"]
-    access_ir --> raw_dependency["03 RAW dependency"]
-    raw_dependency --> classify_edge["04 Unbounded group"]
-    classify_edge --> prove_state["05 Domain-2 proof"]
-    prove_state --> fusion_legal(["06 Fusion legal"])
-```
+To keep the walkthrough readable, snippets omit unrelated operands and give descriptive names to some
+SSA values.
 
 ### Source C++
 
