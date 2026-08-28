@@ -56,13 +56,14 @@ The code under `csv/`, `xml/`, and `fastq/` consists of independently written,
 staged CUDA baselines for reduced state problems corresponding to public cuDF,
 Parabix, and FASTR code. They preserve materialized intermediate bitstreams and
 contain no proposed fused, speculative, or recovery implementation. Each
-workload README pins the closest public files and documents the differences.
+row in the public-source table in `README.md` pins the closest public files and
+documents the differences.
 
 No source code was copied from cuDF, Parabix, or FASTR. Their documentation and
 papers provide workload context only; see `REFERENCES.md`. CUB is supplied by
 the CUDA Toolkit and is not redistributed here.
 
-The FASTQ README maps its state benchmark to public FASTR commit
+The public-source table maps the FASTQ state benchmark to FASTR commit
 `37f2fffaef72e62326cdca45cc84d80d02b82763`. FASTR is MIT-licensed at that
 revision; FASTR code itself is not vendored in this repository.
 

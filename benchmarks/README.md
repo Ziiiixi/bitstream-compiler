@@ -33,15 +33,19 @@ output or count, CUDA-event timing, and an independent CPU correctness check.
 These directories contain no fused, speculative, recovery, or other proposed
 method.
 
-They are not copied source modules. Their READMEs pin the closest public code,
-name the corresponding functions, and state exactly what was simplified:
+They are not copied source modules. The table pins the closest public code,
+names the corresponding functions, and states exactly what was simplified.
 
-| Workload | Public code anchor | Relationship of this baseline |
-|---|---|---|
-| CSV | [cuDF v26.06.01 CSV reader](https://github.com/NVIDIA/cudf/tree/v26.06.01/cpp/src/io/csv) | Isolates binary quote-context propagation and outside-quote delimiter recognition; cuDF's row-context algorithm is richer. |
-| XML | [Parabix XML Pablo pipeline](https://github.com/parabix/parabix-devel-mirror/blob/6ff6d71e0df3906e94f14dc0f14125fdf98e1025/tools/xml/xml.pablo) | Uses the same six lexical classes and reduced quote-aware tag states; the public implementation is CPU/Pablo, not CUDA. |
-| FASTQ | [FASTR chunk/parser code](https://github.com/ALSER-Lab/FASTR/tree/37f2fffaef72e62326cdca45cc84d80d02b82763/src) | Isolates the canonical four-line record phase; it omits FASTR conversion and its more general parser. |
-| Regex | [official BitGen](https://github.com/getianao/BitGen/tree/de7b7db0f385e21c5e6a5e2767f4264da890f9b0) | Unmodified official source, pinned as a submodule. |
+## Public source correspondence
+
+| Workload | Public project and revision | Corresponding public code | Relationship of this benchmark |
+|---|---|---|---|
+| cuJSON | [AutomataLab/cuJSON](https://github.com/AutomataLab/cuJSON/tree/2ac7d3dcd7ad1ff64ebdb14022bf94c59b3b4953), commit `2ac7d3dc` | [`paper_reproduced/src/cuJSON-standardjson.cu`](https://github.com/AutomataLab/cuJSON/blob/2ac7d3dcd7ad1ff64ebdb14022bf94c59b3b4953/paper_reproduced/src/cuJSON-standardjson.cu) | `cujson/upstream/cuJSON-standardjson.cu` retains the upstream tokenizer and differs only by timing code guarded by `CUJSON_STRUCTURAL_BITMAP_TIMER`; measurement stops after structural and filtered open/close bitmaps. |
+| GPJSON | [gpjson-vldb/gpjson](https://github.com/gpjson-vldb/gpjson/tree/c912c1f1564c8bd750765b0650f59b56d334ce71), commit `c912c1f1` | [`combined-escape-carry-newline-count-index.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/combined-escape-carry-newline-count-index.cu); [`quote-index.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/quote-index.cu); [`xor-pre-scan.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/xor-pre-scan.cu), [`xor-post-scan.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/xor-post-scan.cu), and [`xor-rebase.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/xor-rebase.cu); [`string-index.cu`](https://github.com/gpjson-vldb/gpjson/blob/c912c1f1564c8bd750765b0650f59b56d334ce71/language/src/main/resources/it/necst/gpjson/kernels/string-index.cu) | The packaged baseline retains the structural-bitmap stages, fixed launch geometry, escape state, and three-kernel quote-parity scan; later newline and nesting/index construction is outside this benchmark. |
+| CSV | [NVIDIA/cuDF v26.06.01](https://github.com/NVIDIA/cudf/tree/v26.06.01), commit [`77ced62c`](https://github.com/NVIDIA/cudf/commit/77ced62cd91993510ea4a83c611caed64a319d1c) | [`csv_gpu.hpp`: row contexts and block summaries](https://github.com/NVIDIA/cudf/blob/77ced62cd91993510ea4a83c611caed64a319d1c/cpp/src/io/csv/csv_gpu.hpp#L22-L152); [`gather_row_offsets_gpu`](https://github.com/NVIDIA/cudf/blob/77ced62cd91993510ea4a83c611caed64a319d1c/cpp/src/io/csv/csv_gpu.cu#L626-L800); [two-pass orchestration](https://github.com/NVIDIA/cudf/blob/77ced62cd91993510ea4a83c611caed64a319d1c/cpp/src/io/csv/reader_impl.cu#L275-L365); [`seek_field_end`](https://github.com/NVIDIA/cudf/blob/77ced62cd91993510ea4a83c611caed64a319d1c/cpp/src/io/utilities/parsing_utils.cuh#L203-L262) | Independently isolates binary quote-context propagation and outside-quote comma recognition. cuDF instead uses richer multi-context row maps, custom block composition, host prefix resolution, and row-offset emission; there is no exact public cuDF counterpart to this CUB-based CUDA program. |
+| XML | [Parabix development mirror](https://github.com/parabix/parabix-devel-mirror/tree/6ff6d71e0df3906e94f14dc0f14125fdf98e1025), commit `6ff6d71e` | [`Lex` and `ClassifyBytesValidateUtf8`](https://github.com/parabix/parabix-devel-mirror/blob/6ff6d71e0df3906e94f14dc0f14125fdf98e1025/tools/xml/xml.pablo#L29-L109); [`Preprocess`](https://github.com/parabix/parabix-devel-mirror/blob/6ff6d71e0df3906e94f14dc0f14125fdf98e1025/tools/xml/xml.pablo#L264-L370); [`ParseTags`](https://github.com/parabix/parabix-devel-mirror/blob/6ff6d71e0df3906e94f14dc0f14125fdf98e1025/tools/xml/xml.pablo#L402-L530); [`CarryManager`](https://github.com/parabix/parabix-devel-mirror/blob/6ff6d71e0df3906e94f14dc0f14125fdf98e1025/include/pablo/carry_manager.h#L30-L102) | Uses the same six punctuation classes and a reduced quote-aware tag state. The public XML tool is CPU/Pablo; no public Parabix CUDA XML module was found. The four-state summary and CUB scan are independently derived and omit full XML validation. |
+| FASTQ | [ALSER-Lab/FASTR](https://github.com/ALSER-Lab/FASTR/tree/37f2fffaef72e62326cdca45cc84d80d02b82763), commit `37f2fffa` | [`find_last_fastq_record_boundary` and `chunk_generator`](https://github.com/ALSER-Lab/FASTR/blob/37f2fffaef72e62326cdca45cc84d80d02b82763/src/toFASTR_chunk_processor.py#L104-L201); [`parse_fastq_records_from_buffer`](https://github.com/ALSER-Lab/FASTR/blob/37f2fffaef72e62326cdca45cc84d80d02b82763/src/toFASTR_fastq_parser.py#L10-L112) | Isolates canonical four-line record phase as newline materialization, modulo-four summaries, and a CUB scan. It omits FASTR conversion, validation, and its more general multiline parser; FASTR has no corresponding CUDA scan. |
+| Regex | [getianao/BitGen](https://github.com/getianao/BitGen/tree/de7b7db0f385e21c5e6a5e2767f4264da890f9b0), commit `de7b7db0` | Official compiler and benchmark scripts retained under `regex/bitgen` as a Git submodule | Unmodified official BitGen source rather than an independently derived baseline. |
 
 The regex workload is different: `regex/bitgen` is the official, unmodified
 BitGen repository pinned as a Git submodule. It is not one of the independent
@@ -88,10 +92,17 @@ enumeration controls are intentionally slow on the large inputs.
 
 Build products go to `build/` by default and are ignored by Git.
 
-The standalone CSV, XML, and FASTQ baselines and the official BitGen workload
-have workload-specific build and run commands in their own READMEs. Initialize
-the regex source with:
+The standalone baseline interfaces are:
+
+```bash
+./build/csv_baseline <input.csv> [runs]
+./build/xml_baseline <input.xml> [runs]
+./build/fastq_baseline <input.fastq> [runs]
+```
+
+Initialize and run the regex source with:
 
 ```bash
 git submodule update --init --recursive benchmarks/regex/bitgen
+cd benchmarks/regex && ./run.sh
 ```
