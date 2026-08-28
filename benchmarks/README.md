@@ -8,23 +8,8 @@ regex points to the official BitGen implementation.
 The JSON workloads stop at tokenization/structural bitmaps and are not complete
 parser distributions.
 
-## JSON compared methods
 
-The cuJSON and GPJSON workloads retain the same six conceptual controls. They
-are intentionally limited to the tokenization/structural-bitmap stage and are
-not complete JSON parser distributions.
-
-| Method | Purpose | Correctness |
-|---|---|---|
-| Upstream/source-faithful baseline | Original multi-stage pipeline | Correct |
-| BitGen-targeted baseline | Stage-major execution with one CTA per input | Correct |
-| BitGen-style fused | Tile-major fusion with intermediates retained on chip | Correct |
-| Per-thread enumeration | Enumerate states, then resolve them through global-memory readiness | Correct, experimental scheduling caveat |
-| Hierarchical speculation | Speculate, validate, compact true misses, and recover sparsely | Correct |
-| Speculation without validation | Optimistic runtime lower bound (performance upper bound) | Intentionally incorrect |
-
-
-## Baseline-only workloads
+## Baseline workloads
 
 CSV, XML, and FASTQ are independently written standalone CUDA baselines, not
 copied source modules. Their public correspondence and measured scope are
