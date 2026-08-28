@@ -3,11 +3,7 @@
 This directory packages CUDA bitstream workloads. The cuJSON and GPJSON
 directories compare scheduling and fusion strategies for structural-bitmap
 stages. CSV, XML, and FASTQ contain baseline-only staged CUDA workloads, while
-regex points to the official BitGen implementation.
-
-The JSON workloads stop at tokenization/structural bitmaps and are not complete
-parser distributions.
-
+regex points to the official BitGen implementation, and its fused kernel is under development.
 
 ## Baseline workloads
 
