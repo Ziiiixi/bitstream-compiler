@@ -1,12 +1,10 @@
 # JSON GPU fusion-strategy artifact
 
 This directory packages the CUDA code used to compare scheduling and fusion
-strategies on two structural-bitmap workloads derived from cuJSON and GPJSON.
-It is intentionally limited to the tokenization/structural-bitmap stage; it is
+strategies on the bitstream workloads.
+For JSON parsing, It is intentionally limited to the tokenization/structural-bitmap stage; it is
 not a complete JSON parser distribution.
 
-This is the cleaned, self-contained benchmark tree. Generated build products,
-datasets, and historical result bundles are not included.
 
 ## Compared methods
 
@@ -21,13 +19,6 @@ Both workloads retain the same six conceptual controls:
 | Hierarchical speculation | Speculate, validate, compact true misses, and recover sparsely | Correct |
 | Speculation without validation | Optimistic runtime lower bound (performance upper bound) | Intentionally incorrect |
 
-Each workload's `experimental/` directory additionally retains the hierarchical-enumeration
-work: both boundary states are represented before validation and the resolved
-state selects a result, so there is no recovery replay.
-
-“BitGen-targeted” and “BitGen-style” name the execution organization being
-studied. These binaries are experimental controls, not the official BitGen
-implementation.
 
 ## Layout
 
@@ -39,20 +30,6 @@ scripts/                 portable build and run scripts
 results/                 placeholder for results generated after source freeze
 ```
 
-## Requirements
-
-- Linux x86-64
-- NVIDIA GPU and driver
-- CUDA Toolkit with C++17 support (tested with CUDA 12.9)
-- A GPU supporting `cuda::atomic_ref`; the reference machine used an RTX A4000
-  (`sm_86`)
-- Cooperative-kernel launch support for the cuJSON per-thread enumeration
-  control
-- Bash for the reproduction scripts
-
-The seven-input batch requires substantially more GPU memory than a single
-input: approximately 10.34 GiB for the GPJSON targeted baseline and 8.46 GiB
-for GPJSON fused.
 
 ## Quick start
 
@@ -77,34 +54,4 @@ enumeration controls are intentionally slow on the large inputs.
 
 Build products go to `build/` by default and are ignored by Git.
 
-## Timing and correctness
 
-Every experimental executable performs CUDA-event timing around GPU work and
-prints an output checksum or an independent CPU-reference comparison. The
-upstream cuJSON timer has its original fixed five warmups and ten measured
-runs. Other binaries accept a run count; see the workload READMEs for their
-different command-line contracts.
-
-Do not combine per-dataset sequential numbers with the concurrent multi-input
-batch numbers. The scheduling policy is part of each experiment.
-
-## Important limitations
-
-- The no-validation binaries are intentionally incorrect and are only an
-  optimistic performance bound.
-- GPJSON's retained carry rule assumes that a complete logical segment is not
-  made entirely of backslashes. The seven retained datasets satisfy this.
-- The literal per-thread enumeration control can theoretically wait for an
-  unscheduled predecessor block; CUDA does not promise increasing block order.
-- Dataset files are not redistributed here. Verify their source and
-  redistribution terms separately.
-
-## Provenance and licensing
-
-Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before publishing. cuJSON
-is retained under the MIT license and GPJSON-derived material under the
-Universal Permissive License 1.0. Both pinned revisions are recorded here;
-complete notices are retained in the repository's `third_party/licenses/`
-directory.
-The papers motivating and defining the workloads are listed in
-[REFERENCES.md](REFERENCES.md).
