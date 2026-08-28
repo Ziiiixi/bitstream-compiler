@@ -46,6 +46,8 @@ prefix-XOR sequence in simdjson:
 - Audited revision: `de7b7db0f385e21c5e6a5e2767f4264da890f9b0`
 - Local wrapper: `inputs/bitgen/bitgen.cpp`
 - Generated/template-derived body: `inputs/bitgen/regex_0.cu`
+- Official source reference: Git submodule `benchmarks/regex/bitgen` at the
+  audited revision
 
 The BitGen repository did not contain a license statement at the audited
 revision. The retained `regex_0.cu` includes substantial CUDA backend-template
@@ -54,6 +56,9 @@ evaluation, but it must not be made public or redistributed further until the
 authors confirm redistribution terms, or until the file is replaced by an
 independently written example. This restriction also applies to generated
 BitGen analysis snapshots derived from that file.
+
+The benchmark submodule records an external repository and pinned revision;
+it does not grant or imply redistribution or other license rights.
 
 ## Project license
 

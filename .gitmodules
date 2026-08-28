@@ -1,0 +1,3 @@
+[submodule "benchmarks/regex/bitgen"]
+	path = benchmarks/regex/bitgen
+	url = https://github.com/getianao/BitGen.git

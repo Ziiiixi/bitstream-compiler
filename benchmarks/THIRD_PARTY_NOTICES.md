@@ -39,9 +39,32 @@ Apache License 2.0 or MIT license.
 
 ## BitGen
 
-The “BitGen-style” controls are independent implementations inspired by the
-tile-major execution order described in the BitGen paper. No official BitGen
-source or generated kernel is vendored in this artifact. See `REFERENCES.md`.
+The “BitGen-style” controls under `cujson/` and `gpjson/` are independent
+implementations inspired by the tile-major execution order described in the
+BitGen paper.
+
+Separately, `regex/bitgen` is an official, unmodified BitGen Git submodule from
+<https://github.com/getianao/BitGen.git>, pinned at
+`de7b7db0f385e21c5e6a5e2767f4264da890f9b0`. That upstream revision has no
+license file. Inclusion as a pinned submodule does not grant or imply any
+license rights; users must obtain any necessary permission from the upstream
+rightsholders.
+
+## CSV, XML, and FASTQ baselines
+
+The code under `csv/`, `xml/`, and `fastq/` consists of independently written,
+staged CUDA baselines for reduced state problems corresponding to public cuDF,
+Parabix, and FASTR code. They preserve materialized intermediate bitstreams and
+contain no proposed fused, speculative, or recovery implementation. Each
+workload README pins the closest public files and documents the differences.
+
+No source code was copied from cuDF, Parabix, or FASTR. Their documentation and
+papers provide workload context only; see `REFERENCES.md`. CUB is supplied by
+the CUDA Toolkit and is not redistributed here.
+
+The FASTQ README maps its state benchmark to public FASTR commit
+`37f2fffaef72e62326cdca45cc84d80d02b82763`. FASTR is MIT-licensed at that
+revision; FASTR code itself is not vendored in this repository.
 
 ## Datasets
 

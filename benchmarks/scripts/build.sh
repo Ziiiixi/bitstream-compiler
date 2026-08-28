@@ -39,4 +39,13 @@ compile "$GPJSON/src/enumeration.cu" gpjson_enumeration "$GPJSON/include"
 compile "$GPJSON/src/hierarchical_speculation.cu" gpjson_hierarchical_speculation "$GPJSON/include"
 compile "$GPJSON/src/speculation_no_validation.cu" gpjson_speculation_no_validation "$GPJSON/include"
 
+CSV=$ROOT/csv
+compile "$CSV/src/baseline.cu" csv_baseline "$CSV/src"
+
+XML=$ROOT/xml
+compile "$XML/src/baseline.cu" xml_baseline "$XML/src"
+
+FASTQ=$ROOT/fastq
+compile "$FASTQ/src/baseline.cu" fastq_baseline "$FASTQ/src"
+
 echo "[build] complete: $BUILD_DIR"

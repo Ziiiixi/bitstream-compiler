@@ -273,12 +273,17 @@ bitstream-compiler/
 │   └── test/                       # MLIR unit and integration tests
 │
 ├── scripts/run-direct-index.sh     # Reproducible end-to-end driver
+├── benchmarks/                     # CUDA workload baselines and JSON controls
 ├── analysis/{cujson,gpjson,bitgen} # Numbered pass-by-pass IR snapshots
 └── THIRD_PARTY_NOTICES.md          # Workload provenance and licenses
 ```
 
 Generated build trees and Lit output are intentionally excluded from version
 control.
+
+The [benchmark suite](benchmarks/README.md) includes cuJSON and GPJSON controls,
+standalone staged CSV/XML/FASTQ baselines, and the official BitGen regex source
+as a pinned Git submodule.
 
 ## Pass-to-code map
 
