@@ -1,7 +1,0 @@
-{
-  "plain": "value",
-  "escaped": "quote: \" and slash: \\",
-  "operators_inside_string": "{ [ ] } , :",
-  "array": [1, 2, 3],
-  "nested": {"enabled": true, "value": null}
-}

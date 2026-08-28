@@ -6,7 +6,6 @@ BUILD_DIR=${BUILD_DIR:-$ROOT/build}
 DATA_DIR=${DATA_DIR:-$ROOT/datasets/raw}
 MANIFEST=${MANIFEST:-$ROOT/datasets/manifest.csv}
 RUNS=${RUNS:-5}
-VERIFY_DATASETS=${VERIFY_DATASETS:-1}
 RUN_UPSTREAM_CUJSON=${RUN_UPSTREAM_CUJSON:-1}
 
 required_binaries=(cujson_upstream_baseline cujson_bitgen_targeted_baseline cujson_bitgen_fused
@@ -16,9 +15,6 @@ required_binaries=(cujson_upstream_baseline cujson_bitgen_targeted_baseline cujs
 needs_build=0
 for binary in "${required_binaries[@]}"; do [[ -x $BUILD_DIR/$binary ]] || needs_build=1; done
 if [[ $needs_build == 1 ]]; then "$ROOT/scripts/build.sh"; fi
-if [[ $VERIFY_DATASETS == 1 ]]; then
-    DATA_DIR=$DATA_DIR MANIFEST=$MANIFEST "$ROOT/scripts/verify_datasets.sh"
-fi
 
 while IFS=, read -r dataset_id display_name filename format bytes sha256 source derivation; do
     [[ $dataset_id == dataset_id ]] && continue

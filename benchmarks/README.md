@@ -21,7 +21,7 @@ Both workloads retain the same six conceptual controls:
 | Hierarchical speculation | Speculate, validate, compact true misses, and recover sparsely | Correct |
 | Speculation without validation | Optimistic runtime lower bound (performance upper bound) | Intentionally incorrect |
 
-`benchmarks/*/experimental/` additionally retains the hierarchical-enumeration
+Each workload's `experimental/` directory additionally retains the hierarchical-enumeration
 work: both boundary states are represented before validation and the resolved
 state selects a result, so there is no recovery replay.
 
@@ -32,13 +32,11 @@ implementation.
 ## Layout
 
 ```text
-benchmarks/cujson/       cuJSON computation and UTF-validation workload
-benchmarks/gpjson/       GPJSON structural-bitmap workload
+cujson/                  cuJSON computation and UTF-validation workload
+gpjson/                  GPJSON structural-bitmap workload
 datasets/                dataset contract; large inputs are not committed
-scripts/                 portable build, verification, and run scripts
-tests/data/              small correctness fixture
+scripts/                 portable build and run scripts
 results/                 placeholder for results generated after source freeze
-licenses/                third-party license text where available
 ```
 
 ## Requirements
@@ -50,7 +48,7 @@ licenses/                third-party license text where available
   (`sm_86`)
 - Cooperative-kernel launch support for the cuJSON per-thread enumeration
   control
-- Bash, `awk`, and `sha256sum` for the reproduction scripts
+- Bash for the reproduction scripts
 
 The seven-input batch requires substantially more GPU memory than a single
 input: approximately 10.34 GiB for the GPJSON targeted baseline and 8.46 GiB
@@ -60,13 +58,11 @@ for GPJSON fused.
 
 ```bash
 GPU_ARCH=sm_86 ./scripts/build.sh
-CUDA_VISIBLE_DEVICES=0 RUNS=1 ./scripts/run_smoke.sh
 ```
 
 For the large inputs:
 
 ```bash
-DATA_DIR=/path/to/datasets ./scripts/verify_datasets.sh
 DATA_DIR=/path/to/datasets RUNS=5 ./scripts/run_per_dataset.sh
 ```
 
@@ -107,7 +103,8 @@ batch numbers. The scheduling policy is part of each experiment.
 
 Read [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before publishing. cuJSON
 is retained under the MIT license and GPJSON-derived material under the
-Universal Permissive License 1.0. Both pinned revisions and complete notices
-are recorded in the artifact.
+Universal Permissive License 1.0. Both pinned revisions are recorded here;
+complete notices are retained in the repository's `third_party/licenses/`
+directory.
 The papers motivating and defining the workloads are listed in
 [REFERENCES.md](REFERENCES.md).

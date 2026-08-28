@@ -2,11 +2,7 @@
 
 Place the seven large inputs in a directory outside the repository and pass it
 as `DATA_DIR`. The expected names, byte sizes, and SHA-256 hashes are recorded
-in `manifest.csv`.
-
-```bash
-DATA_DIR=/path/to/datasets ./scripts/verify_datasets.sh
-```
+in `manifest.csv` for manual integrity checks.
 
 The files total 8,074,397,402 bytes (7.520 GiB). They are not committed because
 of their size and unresolved redistribution terms. The six `*_large_record`

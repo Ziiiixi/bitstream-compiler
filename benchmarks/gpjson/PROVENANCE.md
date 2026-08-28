@@ -9,5 +9,6 @@ unrelated parser stages because this artifact compares only structural-bitmap
 generation.
 
 The retained material is governed by the Universal Permissive License,
-Version 1.0. The complete notice is in `licenses/gpJSON-UPL-1.0.txt` at the
-artifact root. See the repository root `THIRD_PARTY_NOTICES.md`.
+Version 1.0. The complete notice is in
+`../../third_party/licenses/gpJSON-UPL-1.0.txt`. See
+`../THIRD_PARTY_NOTICES.md` for benchmark-specific provenance.
